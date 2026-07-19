@@ -18,8 +18,21 @@ import (
 )
 
 type Meta struct {
-	Name        string `yaml:"name"`
-	Description string `yaml:"description,omitempty"`
+	Name        string        `yaml:"name"`
+	Description string        `yaml:"description,omitempty"`
+	Doctor      []DoctorCheck `yaml:"doctor,omitempty"`
+}
+
+// DoctorCheck is a workspace-declared prerequisite probe. The engine knows
+// nothing about the tools it invokes — environment specifics live in the
+// workspace, per the repo-separation rule.
+type DoctorCheck struct {
+	Name    string   `yaml:"name"`
+	Command string   `yaml:"command,omitempty"` // run via sh -c; non-zero exit = fail
+	URL     string   `yaml:"url,omitempty"`     // GET; non-2xx = fail
+	Expect  string   `yaml:"expect,omitempty"`  // substring that must appear in the output
+	Fail    []string `yaml:"fail,omitempty"`    // substrings that fail even on exit 0 (e.g. CLIs that exit 0 on bad tokens)
+	Fix     string   `yaml:"fix,omitempty"`
 }
 
 // Gatekeeper restricts which agents may bind to states of a class.
@@ -37,6 +50,7 @@ type Workspace struct {
 	Description string
 	Path        string
 	GitVersion  string
+	Doctor      []DoctorCheck
 
 	Workflows map[string]*core.WorkflowDefinition
 	Agents    map[string]*core.AgentSpec
@@ -69,6 +83,15 @@ func Load(path string) (*Workspace, []error) {
 	ws.Name = meta.Name
 	ws.Description = meta.Description
 	ws.GitVersion = gitVersion(path)
+	ws.Doctor = meta.Doctor
+	for i, dc := range meta.Doctor {
+		if dc.Name == "" {
+			fail("workspace.yaml: doctor check %d: name is required", i)
+		}
+		if (dc.Command == "") == (dc.URL == "") {
+			fail("workspace.yaml: doctor check %q: exactly one of command/url required", dc.Name)
+		}
+	}
 
 	if err := readYAML(filepath.Join(path, "policies.yaml"), &ws.Policies); err != nil && !os.IsNotExist(err) {
 		fail("policies.yaml: %v", err)

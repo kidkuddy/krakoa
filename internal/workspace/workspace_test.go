@@ -27,6 +27,9 @@ func TestLoadValid(t *testing.T) {
 	if _, ok := ws.Skills["glab-ops"]; !ok {
 		t.Errorf("skills = %v", ws.Skills)
 	}
+	if len(ws.Doctor) != 2 || ws.Doctor[0].URL == "" || ws.Doctor[1].Command != "echo hello" || ws.Doctor[1].Fail[0] != "boom" {
+		t.Errorf("doctor checks = %+v", ws.Doctor)
+	}
 	w := ws.Watchers["draft-mr-watch"]
 	if w == nil || w.Every.D() != 10*time.Minute || w.Mode != "spawn" {
 		t.Fatalf("watcher = %+v", w)
@@ -117,6 +120,15 @@ func TestLoadBroken(t *testing.T) {
 			os.WriteFile(f, append(raw, []byte("\ntypo_field: x\n")...), 0o644)
 		})
 		wantErr(t, errs, "typo_field")
+	})
+
+	t.Run("doctor check with both command and url", func(t *testing.T) {
+		errs := broken(t, func(dir string) {
+			f := filepath.Join(dir, "workspace.yaml")
+			body := "name: testws\ndoctor:\n  - {name: bad, command: echo x, url: http://x/}\n"
+			os.WriteFile(f, []byte(body), 0o644)
+		})
+		wantErr(t, errs, "exactly one of command/url")
 	})
 
 	t.Run("missing workspace.yaml", func(t *testing.T) {
