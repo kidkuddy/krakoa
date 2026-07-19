@@ -1,0 +1,5 @@
+command: scripts/fail.sh
+every: 5m
+mode: spawn
+workflow: cmdflow
+spawn_on: [never-happens]

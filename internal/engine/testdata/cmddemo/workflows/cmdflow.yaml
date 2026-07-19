@@ -1,0 +1,13 @@
+name: cmdflow
+trigger: {kind: watcher, watcher: cmd-watch}
+inputs:
+  key: {type: string, required: true}
+start: waiting
+states:
+  waiting:
+    step: wait
+    arms:
+      - probe: {command: "scripts/check.sh $input.key", every: 1m}
+      - {timeout: 1h}
+    on: {ready: done, timeout: done}
+  done: {terminal: true}

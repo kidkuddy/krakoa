@@ -1,0 +1,26 @@
+name: sweep
+trigger: {kind: watcher, watcher: draft-mr-watch}
+inputs:
+  mr_iid: {type: string, required: true}
+concurrency: 2
+start: reviewing
+states:
+  reviewing:
+    step: agent
+    class: code-review
+    agent: reviewer
+    instruction: review MR $input.mr_iid
+    on: {pass: marking, fail: waiting, noop: done}
+  marking:
+    step: agent
+    agent: operator
+    instruction: mark ready
+    on: {ok: done}
+  waiting:
+    step: wait
+    arms:
+      - event: retriggered
+      - timeout: 2h
+    on: {retriggered: reviewing, timeout: done}
+    budgets: {retriggered: 3}
+  done: {terminal: true}

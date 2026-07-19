@@ -1,0 +1,10 @@
+name: testws
+description: fixture workspace
+doctor:
+  - name: fake daemon
+    url: http://127.0.0.1:1/healthz
+    fix: start it
+  - name: fake cli
+    command: echo hello
+    expect: hello
+    fail: [boom]

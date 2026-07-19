@@ -1,0 +1,3 @@
+gatekeepers:
+  - class: code-review
+    agents: [reviewer]

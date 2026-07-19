@@ -1,0 +1,29 @@
+name: review-sweeper
+trigger: {kind: watcher, watcher: draft-mr-watch}
+inputs:
+  repo: {type: string, required: true}
+  mr_iid: {type: string, required: true}
+  head_sha: {type: string, required: true}
+concurrency: 2
+start: reviewing
+states:
+  reviewing:
+    step: agent
+    class: code-review
+    agent: reviewer
+    instruction: "Review the MR at its head SHA. Check-first: MR open, head unchanged, else noop."
+    in: {repo: $input.repo, mr_iid: $input.mr_iid, head_sha: $input.head_sha}
+    on: {pass: marking-ready, fail: requesting-changes, noop: done}
+  marking-ready:
+    step: agent
+    agent: code-operator
+    instruction: glab mr update --ready; resolved-note comment on ticket if a prior changes-requested comment exists.
+    in: {repo: $input.repo, mr_iid: $input.mr_iid}
+    on: {ok: done}
+  requesting-changes:
+    step: agent
+    agent: tracker-operator
+    instruction: "Post review comment on ticket (retriggers bot); glab mr update --draft; if MR already merged, create follow-up ticket instead."
+    in: {repo: $input.repo, mr_iid: $input.mr_iid, findings: $reviewing.findings}
+    on: {ok: done}
+  done: {terminal: true}
