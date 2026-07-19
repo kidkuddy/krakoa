@@ -12,10 +12,24 @@ var refRe = regexp.MustCompile(`\$[a-zA-Z0-9_-]+(\.[a-zA-Z0-9_-]+)*`)
 // Resolve looks up a $-path against a run's inputs and context.
 // "$input.idea" -> run.Inputs["idea"]; "$grounding.questions" ->
 // run.Context["grounding"].(map)["questions"]; non-$ values are literals.
+// A trailing "?" marks the ref optional: unresolvable -> nil, not an error
+// (e.g. "$asking?" before any question round has happened).
 func Resolve(run *Run, expr string) (any, error) {
 	if !strings.HasPrefix(expr, "$") {
 		return expr, nil
 	}
+	optional := strings.HasSuffix(expr, "?")
+	if optional {
+		expr = strings.TrimSuffix(expr, "?")
+	}
+	v, err := resolvePath(run, expr)
+	if err != nil && optional {
+		return nil, nil
+	}
+	return v, err
+}
+
+func resolvePath(run *Run, expr string) (any, error) {
 	parts := strings.Split(strings.TrimPrefix(expr, "$"), ".")
 	var cur any
 	if parts[0] == "input" {

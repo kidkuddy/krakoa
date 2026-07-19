@@ -231,6 +231,9 @@ func TestResolve(t *testing.T) {
 		{"$grounding.verdict", "grounded", false},
 		{"$grounding.nested.k", "v", false},
 		{"$grounding.missing", nil, true},
+		{"$grounding.missing?", nil, false},
+		{"$asking?", nil, false},
+		{"$grounding.verdict?", "grounded", false},
 		{"$nope", nil, true},
 		{"$input.nope", nil, true},
 	}
