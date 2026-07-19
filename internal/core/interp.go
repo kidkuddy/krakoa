@@ -100,6 +100,10 @@ func Advance(def *WorkflowDefinition, run Run, outcome string, result map[string
 			run.Context = map[string]any{}
 		}
 		run.Context[run.State] = result
+		// "$last" always names the result that caused this transition —
+		// the only safe payload source for states with multiple incoming
+		// edges (e.g. a question gate fed by refiner OR grounder).
+		run.Context["last"] = result
 	}
 	next, ok := st.On[outcome]
 	if !ok {

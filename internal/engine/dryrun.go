@@ -156,6 +156,12 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 			if g == nil {
 				return fmt.Errorf("gated but no open gate")
 			}
+			// A delivered payload still carrying a $ref means the template
+			// is unresolvable on THIS incoming edge — the human (and the
+			// Slack ping) would see raw template text. Definition bug.
+			if m := payloadRefRe.FindString(g.Payload); m != "" {
+				return fmt.Errorf("gate %s: payload ref %s is unresolvable on this incoming edge (bind per-edge, e.g. $last.<field>)", g.State, m)
+			}
 			resp, outcome, answers := gateChoice(def, cur, g, choose)
 			record(cur.State, outcome)
 			fmt.Fprintf(out, "  gate %s: answering %q\n", g.State, resp)
@@ -349,16 +355,26 @@ func distanceTo(def *core.WorkflowDefinition, includeTimeout bool, targets ...st
 	return dist
 }
 
+// payloadRefRe flags any $ref left in human-facing text (bare or dotted).
+var payloadRefRe = regexp.MustCompile(`\$[a-zA-Z_][a-zA-Z0-9_-]*`)
+
 var dryRefRe = regexp.MustCompile(`\$([a-zA-Z0-9_-]+)((?:\.[a-zA-Z0-9_-]+)+)`)
 
 // referencedFields collects, per state, the $state.field paths the rest of
 // the definition dereferences — the synthetic results must contain them.
 func referencedFields(def *core.WorkflowDefinition) map[string][]string {
 	out := map[string][]string{}
+	var lastFields []string
 	add := func(tmpl string) {
 		for _, m := range dryRefRe.FindAllStringSubmatch(tmpl, -1) {
 			state, path := m[1], strings.TrimPrefix(m[2], ".")
 			if state == "input" {
+				continue
+			}
+			if state == "last" {
+				// "$last" binds to whichever result caused the transition —
+				// any state's synthetic result must be able to carry it
+				lastFields = append(lastFields, path)
 				continue
 			}
 			if _, ok := def.States[state]; !ok {
@@ -367,6 +383,11 @@ func referencedFields(def *core.WorkflowDefinition) map[string][]string {
 			out[state] = append(out[state], path)
 		}
 	}
+	defer func() {
+		for name := range def.States {
+			out[name] = append(out[name], lastFields...)
+		}
+	}()
 	for _, st := range def.States {
 		add(st.Instruction)
 		for _, v := range st.In {

@@ -2,6 +2,7 @@ package core
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -246,5 +247,36 @@ func TestResolve(t *testing.T) {
 		if !tc.wantErr && !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("%s = %v, want %v", tc.expr, got, tc.want)
 		}
+	}
+}
+
+func TestAdvanceBindsLast(t *testing.T) {
+	def := testDef()
+	run := newRun("grounding")
+	d := Advance(def, run, "ungrounded", map[string]any{"questions": []any{"q1"}})
+	if d.Run.State != "asking" {
+		t.Fatalf("state = %s", d.Run.State)
+	}
+	last, _ := d.Run.Context["last"].(map[string]any)
+	if last == nil || last["questions"] == nil {
+		t.Fatalf("$last not bound: %+v", d.Run.Context)
+	}
+	g := d.Actions[0].(ActionOpenGate)
+	if g.Payload != "questions: [q1]" {
+		t.Fatalf("payload = %q", g.Payload)
+	}
+}
+
+func TestValidateReservedStateNames(t *testing.T) {
+	def := testDef()
+	def.States["last"] = State{Terminal: true}
+	found := false
+	for _, err := range Validate(def) {
+		if strings.Contains(err.Error(), "reserved name") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("state named 'last' should be rejected")
 	}
 }

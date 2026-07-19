@@ -49,6 +49,9 @@ func Validate(def *WorkflowDefinition) []error {
 
 	terminals := 0
 	for _, name := range names {
+		if name == "input" || name == "last" {
+			fail("state %s: reserved name (template namespace)", name)
+		}
 		st := def.States[name]
 		if st.Terminal {
 			terminals++

@@ -20,7 +20,7 @@ states:
     on: {grounded: filing, ungrounded: asking}
   asking:
     step: gate
-    gate: {kind: question, payload: "refine needs answers: $grounding.questions"}
+    gate: {kind: question, payload: "refine needs answers: $last.questions"}
     on: {answered: refining}
     budgets: {answered: 3}
   filing:
