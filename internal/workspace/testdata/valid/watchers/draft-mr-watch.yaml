@@ -1,0 +1,4 @@
+agent: operator
+every: 10m
+mode: spawn
+workflow: sweep

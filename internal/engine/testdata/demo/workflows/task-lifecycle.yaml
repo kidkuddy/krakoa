@@ -1,0 +1,80 @@
+name: task-lifecycle
+trigger: {kind: manual}
+inputs:
+  idea: {type: text, required: true}
+  repo: {type: string, default: acme/demo-app}
+concurrency: 3
+start: refining
+states:
+  refining:
+    step: agent
+    agent: refiner
+    instruction: Write an autonomous scrum ticket for the idea.
+    in: {idea: $input.idea, repo: $input.repo}
+    on: {ok: grounding, questions: asking}
+  grounding:
+    step: agent
+    agent: grounder
+    instruction: Verify every claim in the ticket traces to the idea and answers.
+    in: {idea: $input.idea, ticket: $refining.ticket}
+    on: {grounded: filing, ungrounded: asking}
+  asking:
+    step: gate
+    gate: {kind: question, payload: "refine needs answers: $grounding.questions"}
+    on: {answered: refining}
+    budgets: {answered: 3}
+  filing:
+    step: agent
+    agent: tracker-operator
+    instruction: Create the ticket (backlog, unassigned, conventions appended).
+    in: {ticket: $refining.ticket, repo: $input.repo}
+    on: {ok: dispatching}
+  dispatching:
+    step: agent
+    agent: tracker-operator
+    instruction: Assign the ticket to the builder bot (assign auto-enqueues).
+    in: {ticket_id: $filing.ticket_id}
+    on: {ok: building}
+  building:
+    step: wait
+    arms:
+      - {event: ticket-in-review, correlate: $filing.ticket_id}
+      - {timeout: 8h}
+    on: {ticket-in-review: awaiting-ready, timeout: stalled}
+  awaiting-ready:
+    step: wait
+    arms:
+      - {event: mr-ready, correlate: $filing.ticket_id}
+      - {event: ticket-in-progress, correlate: $filing.ticket_id}
+      - {timeout: 24h}
+    on: {mr-ready: merging, ticket-in-progress: building, timeout: stalled}
+  merging:
+    step: agent
+    agent: code-operator
+    instruction: Check-first (open+ready+same head), rebase if behind, merge, keep source branch.
+    in: {ticket_id: $filing.ticket_id}
+    on: {merged: notifying, precondition-fail: awaiting-ready, conflict: retriggering}
+  notifying:
+    step: agent
+    agent: notifier
+    instruction: "niffty: '$filing.ticket_id merged: $merging.mr_url'"
+    on: {ok: closing}
+  closing:
+    step: agent
+    agent: tracker-operator
+    instruction: Set the ticket done.
+    in: {ticket_id: $filing.ticket_id}
+    on: {ok: done}
+  stalled:
+    step: gate
+    gate: {kind: choice, payload: "run stalled in the build loop", options: [rerun, wait, abandon]}
+    on: {rerun: retriggering, wait: building, abandon: abandoned}
+  retriggering:
+    step: agent
+    agent: tracker-operator
+    instruction: Comment findings, set ticket in_progress.
+    in: {ticket_id: $filing.ticket_id}
+    on: {ok: building}
+    budgets: {ok: 3}
+  done: {terminal: true}
+  abandoned: {terminal: true}

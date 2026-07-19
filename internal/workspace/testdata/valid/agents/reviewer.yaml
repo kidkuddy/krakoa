@@ -1,0 +1,4 @@
+persona: |
+  You are a strict reviewer.
+skills: [glab-ops]
+worktree: true

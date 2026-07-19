@@ -1,0 +1,5 @@
+agent: watch-probe
+every: 10m
+mode: spawn
+workflow: review-sweeper
+spawn_on: [mr-draft-pending]
