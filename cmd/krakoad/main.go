@@ -126,12 +126,33 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		writeJSON(w, code, map[string]string{"error": err.Error()})
 	}
 
+	mux.HandleFunc("GET /ui", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(uiHTML))
+	})
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		wss := map[string]string{}
 		for name, ws := range workspaces {
 			wss[name] = ws.GitVersion
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "workspaces": wss, "invalid": invalid})
+	})
+
+	// Slim workspace inventory so clients (doctor) never need
+	// KRAKOA_WORKSPACES themselves — the daemon owns workspaces.
+	mux.HandleFunc("GET /v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		type wsInfo struct {
+			Name       string
+			Path       string
+			GitVersion string
+			Doctor     []workspace.DoctorCheck
+		}
+		out := []wsInfo{}
+		for _, ws := range workspaces {
+			out = append(out, wsInfo{Name: ws.Name, Path: ws.Path, GitVersion: ws.GitVersion, Doctor: ws.Doctor})
+		}
+		writeJSON(w, 200, out)
 	})
 
 	mux.HandleFunc("POST /v1/runs", func(w http.ResponseWriter, r *http.Request) {

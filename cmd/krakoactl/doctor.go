@@ -49,13 +49,54 @@ func cmdDoctor() error {
 	bin, err := runner.ResolveBin()
 	check("claude binary", err == nil, bin, "install claude or set KRAKOA_CLAUDE_BIN")
 
-	var workspaces []*workspace.Workspace
-	wsPaths := os.Getenv("KRAKOA_WORKSPACES")
-	if wsPaths == "" {
-		check("KRAKOA_WORKSPACES", false, "not set", "export KRAKOA_WORKSPACES=<path-to-workspace-dir>[,...]")
+	// The daemon owns workspaces: prefer its inventory (and its declared
+	// doctor checks). KRAKOA_WORKSPACES is only a fallback for a client
+	// shell when krakoad is down.
+	type wsInfo struct {
+		Name       string
+		Path       string
+		GitVersion string
+		Doctor     []workspace.DoctorCheck
+	}
+	var daemonWS []wsInfo
+	daemonUp := call("GET", "/v1/workspaces", nil, &daemonWS) == nil
+	if !daemonUp {
+		if ok, _ := httpOK(addr() + "/healthz"); ok {
+			// alive but predates /v1/workspaces — an older binary
+			check("krakoad", false, "running but stale (no /v1/workspaces)",
+				"restart krakoad once no agent step is mid-flight (waiting/gated runs recover cleanly)")
+		} else {
+			check("krakoad", false, addr(), "start krakoad (launchctl or bin/krakoad)")
+		}
 	} else {
+		check("krakoad", true, addr(), "")
+	}
+
+	var checks []struct {
+		ws string
+		dc workspace.DoctorCheck
+	}
+	if daemonUp {
+		for _, ws := range daemonWS {
+			check("workspace "+ws.Name, true, fmt.Sprintf("loaded by krakoad (git %s)", ws.GitVersion), "")
+			for _, dc := range ws.Doctor {
+				checks = append(checks, struct {
+					ws string
+					dc workspace.DoctorCheck
+				}{ws.Name, dc})
+			}
+		}
+	} else {
+		wsPaths := os.Getenv("KRAKOA_WORKSPACES")
+		if wsPaths == "" {
+			check("KRAKOA_WORKSPACES", false, "not set (and krakoad is down — nothing to check workspaces against)",
+				"start krakoad, or export KRAKOA_WORKSPACES=<path>[,...] for offline validation")
+		}
 		for _, p := range strings.Split(wsPaths, ",") {
 			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
 			ws, errs := workspace.Load(p)
 			name := p
 			if ws != nil && ws.Name != "" {
@@ -63,19 +104,19 @@ func cmdDoctor() error {
 			}
 			check("workspace "+name, len(errs) == 0, fmt.Sprintf("%d error(s)", len(errs)), "krakoactl workspace validate "+p)
 			if len(errs) == 0 {
-				workspaces = append(workspaces, ws)
+				for _, dc := range ws.Doctor {
+					checks = append(checks, struct {
+						ws string
+						dc workspace.DoctorCheck
+					}{ws.Name, dc})
+				}
 			}
 		}
 	}
 
-	ok, detail := httpOK(addr() + "/healthz")
-	check("krakoad", ok, detail, "start krakoad (launchctl or bin/krakoad)")
-
-	for _, ws := range workspaces {
-		for _, dc := range ws.Doctor {
-			ok, detail := runDoctorCheck(dc)
-			check(ws.Name+": "+dc.Name, ok, detail, dc.Fix)
-		}
+	for _, c := range checks {
+		ok, detail := runDoctorCheck(c.dc)
+		check(c.ws+": "+c.dc.Name, ok, detail, c.dc.Fix)
 	}
 
 	if failed > 0 {

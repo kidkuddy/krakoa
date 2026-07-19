@@ -19,6 +19,7 @@ import (
 )
 
 const usage = `usage: krakoactl <command> [args]
+(flags may appear before or after positional arguments)
 
   run <workflow> --workspace <ws> [--input k=v]...   start a run
   runs [--status s1,s2]                              list runs
@@ -108,6 +109,24 @@ func call(method, path string, body any, out any) error {
 	return nil
 }
 
+// parseAnywhere parses a flag set allowing flags before AND after
+// positionals (stdlib flag stops at the first non-flag; that cost three
+// failed attempts in a live session). Returns the positionals in order.
+func parseAnywhere(fs *flag.FlagSet, args []string) ([]string, error) {
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return pos, nil
+		}
+		pos = append(pos, rest[0])
+		args = rest[1:]
+	}
+}
+
 // kvFlags collects repeated k=v flags into a map.
 type kvFlags map[string]any
 
@@ -126,13 +145,17 @@ func cmdRun(args []string) error {
 	ws := fs.String("workspace", "", "workspace name")
 	inputs := kvFlags{}
 	fs.Var(inputs, "input", "input k=v (repeatable)")
-	fs.Parse(args)
-	if fs.NArg() < 1 || *ws == "" {
-		return fmt.Errorf("usage: run <workflow> --workspace <ws> [--input k=v]")
+	pos, err := parseAnywhere(fs, args)
+	if err != nil {
+		return err
+	}
+	// the workflow is required — a silent default once started the wrong thing
+	if len(pos) != 1 || *ws == "" {
+		return fmt.Errorf("usage: run <workflow> --workspace <ws> [--input k=v] (flags may go anywhere; exactly one workflow name)")
 	}
 	var run map[string]any
 	if err := call("POST", "/v1/runs", map[string]any{
-		"workspace": *ws, "workflow": fs.Arg(0), "inputs": map[string]any(inputs),
+		"workspace": *ws, "workflow": pos[0], "inputs": map[string]any(inputs),
 	}, &run); err != nil {
 		return err
 	}
@@ -185,12 +208,15 @@ func cmdAnswer(args []string) error {
 	fs := flag.NewFlagSet("answer", flag.ExitOnError)
 	answers := kvFlags{}
 	fs.Var(answers, "answers", "answer k=v for question gates (repeatable)")
-	fs.Parse(args)
-	if fs.NArg() < 2 {
+	pos, err := parseAnywhere(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 2 {
 		return fmt.Errorf("usage: answer <gate-id> <response> [--answers k=v]")
 	}
-	return call("POST", "/v1/gates/"+fs.Arg(0)+"/answer", map[string]any{
-		"response": fs.Arg(1), "answers": map[string]any(answers), "responder": "cli",
+	return call("POST", "/v1/gates/"+pos[0]+"/answer", map[string]any{
+		"response": pos[1], "answers": map[string]any(answers), "responder": "cli",
 	}, nil)
 }
 
@@ -200,8 +226,11 @@ func cmdEmit(args []string) error {
 	key := fs.String("key", "", "dedupe/correlation key")
 	run := fs.String("run", os.Getenv("KRAKOA_RUN"), "target run id")
 	payload := fs.String("payload", "", "JSON payload")
-	fs.Parse(args)
-	if fs.NArg() < 1 {
+	pos, err := parseAnywhere(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
 		return fmt.Errorf("usage: emit <event> --workspace <ws> [--key k] [--run id] [--payload json]")
 	}
 	var p map[string]any
@@ -212,7 +241,7 @@ func cmdEmit(args []string) error {
 	}
 	var out map[string]string
 	if err := call("POST", "/v1/emit", map[string]any{
-		"workspace": *ws, "event": fs.Arg(0), "key": *key, "run": *run, "payload": p,
+		"workspace": *ws, "event": pos[0], "key": *key, "run": *run, "payload": p,
 	}, &out); err != nil {
 		return err
 	}
