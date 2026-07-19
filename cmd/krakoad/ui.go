@@ -1,124 +1,294 @@
 package main
 
 // The audit UI: one self-contained page (inline CSS/JS, zero external
-// assets) polling the existing JSON endpoints. Presentation only — the
-// event spine is the data. Served on the loopback ingress; never published.
+// assets) over the existing JSON endpoints. Langfuse-shaped: a runs table,
+// and per run a state-visit waterfall with a detail panel per span. Raw
+// events stay collapsed — the page answers "where is it, what does it need
+// from me, what did it cost", not "here is the database".
 
 const uiHTML = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>krakoa</title>
 <style>
-  :root { --bg:#111418; --panel:#1a1f26; --line:#2a323d; --fg:#d7dde5; --dim:#7d8794;
-          --ok:#4cc38a; --warn:#e5b567; --bad:#e5484d; --acc:#6ca6e0; }
+  :root {
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232c; --line:#232a33;
+    --fg:#d5dce4; --dim:#8b96a3; --faint:#5a6572;
+    --blue:#58a6ff; --amber:#d4a72c; --red:#f85149; --green:#3fb950; --purple:#bc8cff;
+  }
   * { box-sizing:border-box; margin:0; }
-  body { background:var(--bg); color:var(--fg); font:13px/1.5 ui-monospace,Menlo,monospace; }
-  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:baseline; }
-  header h1 { font-size:14px; letter-spacing:2px; }
-  header span { color:var(--dim); font-size:11px; }
-  main { display:grid; grid-template-columns:340px 1fr; min-height:calc(100vh - 41px); }
-  #runs { border-right:1px solid var(--line); overflow-y:auto; }
-  .run { padding:9px 14px; border-bottom:1px solid var(--line); cursor:pointer; }
-  .run:hover, .run.sel { background:var(--panel); }
-  .run .id { color:var(--acc); }
-  .badge { padding:0 6px; border-radius:3px; font-size:11px; }
-  .s-running { color:var(--acc); } .s-waiting { color:var(--warn); }
-  .s-gated { color:var(--warn); } .s-done { color:var(--ok); }
-  .s-failed, .s-needs-attention { color:var(--bad); font-weight:bold; }
-  .s-queued, .s-canceled { color:var(--dim); }
-  #detail { padding:14px 18px; overflow-y:auto; }
-  h2 { font-size:13px; color:var(--dim); text-transform:uppercase; letter-spacing:1px; margin:16px 0 6px; }
-  .gate { border:1px solid var(--warn); border-radius:4px; padding:8px 12px; margin:6px 0; }
-  .gate.att { border-color:var(--bad); }
-  .gate code { color:var(--acc); user-select:all; }
-  .step { border:1px solid var(--line); border-radius:4px; padding:8px 12px; margin:6px 0; background:var(--panel); }
-  .step .meta { color:var(--dim); font-size:12px; }
-  .step .err { color:var(--bad); white-space:pre-wrap; }
-  table { border-collapse:collapse; width:100%; }
-  td { padding:2px 10px 2px 0; vertical-align:top; white-space:nowrap; }
-  td.data { white-space:normal; color:var(--dim); word-break:break-all; }
-  td.t { color:var(--dim); }
-  .empty { color:var(--dim); padding:20px; }
+  html,body { height:100%; }
+  body { background:var(--bg); color:var(--fg);
+         font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  code, .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  a { color:var(--blue); text-decoration:none; cursor:pointer; }
+
+  header { display:flex; align-items:center; gap:14px; padding:10px 20px;
+           border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:5; }
+  header .brand { font-weight:700; letter-spacing:3px; font-size:13px; }
+  header .crumb { color:var(--dim); }
+  header .right { margin-left:auto; color:var(--faint); font-size:12px; }
+  .gatepill { background:var(--amber); color:#111; border-radius:10px; padding:1px 9px;
+              font-weight:600; font-size:12px; }
+
+  main { max-width:1060px; margin:0 auto; padding:18px 20px 60px; }
+
+  /* status chips */
+  .chip { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .c-running { background:rgba(88,166,255,.15); color:var(--blue); }
+  .c-waiting { background:rgba(212,167,44,.15); color:var(--amber); }
+  .c-gated   { background:rgba(212,167,44,.25); color:var(--amber); }
+  .c-queued  { background:rgba(139,150,163,.15); color:var(--dim); }
+  .c-done    { background:rgba(63,185,80,.15); color:var(--green); }
+  .c-failed, .c-needs-attention, .c-canceled { background:rgba(248,81,73,.15); color:var(--red); }
+
+  /* runs table */
+  table.runs { width:100%; border-collapse:collapse; }
+  .runs th { text-align:left; color:var(--faint); font-size:11px; text-transform:uppercase;
+             letter-spacing:.8px; font-weight:600; padding:6px 10px; border-bottom:1px solid var(--line); }
+  .runs td { padding:9px 10px; border-bottom:1px solid var(--line); }
+  .runs tr.r:hover { background:var(--panel); cursor:pointer; }
+  .runs .num { text-align:right; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .dim { color:var(--dim); } .faint { color:var(--faint); }
+
+  /* gate banner */
+  .gate { border:1px solid rgba(212,167,44,.5); background:rgba(212,167,44,.07);
+          border-radius:6px; padding:10px 14px; margin:0 0 14px; }
+  .gate.att { border-color:rgba(248,81,73,.6); background:rgba(248,81,73,.07); }
+  .gate .q { margin-bottom:6px; }
+  .gate code { background:var(--panel2); padding:2px 7px; border-radius:4px; user-select:all; }
+
+  /* run header card */
+  .runhead { display:flex; gap:26px; flex-wrap:wrap; align-items:baseline;
+             padding:14px 16px; background:var(--panel); border:1px solid var(--line);
+             border-radius:6px; margin-bottom:14px; }
+  .runhead .kv .k { color:var(--faint); font-size:11px; text-transform:uppercase; letter-spacing:.8px; }
+  .runhead .kv .v { font-size:15px; margin-top:2px; }
+
+  /* waterfall */
+  .wf { border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  .row { display:grid; grid-template-columns:170px 1fr 130px; align-items:center;
+         padding:7px 12px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .row:last-child { border-bottom:none; }
+  .row:hover, .row.sel { background:var(--panel); }
+  .row .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .row .sub { color:var(--faint); font-size:11px; }
+  .track { position:relative; height:16px; margin:0 10px; }
+  .bar { position:absolute; top:3px; height:10px; border-radius:3px; min-width:6px; opacity:.9; }
+  .b-agent { background:var(--blue); } .b-wait { background:var(--amber); }
+  .b-gate { background:var(--purple); } .b-park { background:var(--red); }
+  .bar.live { animation:pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity:.95; } 50% { opacity:.35; } }
+  @media (prefers-reduced-motion: reduce) { .bar.live { animation:none; } }
+  .row .right { text-align:right; font-family:ui-monospace,Menlo,monospace; font-size:11px; color:var(--dim); }
+
+  /* span detail */
+  .spandetail { margin-top:14px; border:1px solid var(--line); border-radius:6px;
+                background:var(--panel); padding:14px 16px; }
+  .spandetail h3 { font-size:13px; margin-bottom:8px; }
+  .spandetail .meta { color:var(--dim); font-size:12px; margin-bottom:10px; }
+  .spandetail .meta .mono { user-select:all; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:5px;
+        padding:10px 12px; overflow-x:auto; font-size:12px; line-height:1.5;
+        max-height:280px; overflow-y:auto; margin:6px 0 10px; }
+  .lbl { color:var(--faint); font-size:11px; text-transform:uppercase; letter-spacing:.8px; }
+  .err { color:var(--red); }
+
+  details.raw { margin-top:16px; }
+  details.raw summary { color:var(--faint); cursor:pointer; font-size:12px; }
+  details.raw table { border-collapse:collapse; width:100%; margin-top:8px; }
+  details.raw td { padding:2px 10px 2px 0; vertical-align:top; font-size:12px;
+                   font-family:ui-monospace,Menlo,monospace; }
+  details.raw td.d { color:var(--faint); word-break:break-all; white-space:normal; }
+  .empty { color:var(--faint); padding:26px; text-align:center; }
 </style>
 </head>
 <body>
-<header><h1>KRAKOA</h1><span id="stat">connecting…</span></header>
-<main>
-  <div id="runs"></div>
-  <div id="detail"><div class="empty">select a run</div></div>
-</main>
+<header>
+  <span class="brand">KRAKOA</span>
+  <span class="crumb" id="crumb"></span>
+  <span id="gates-pill"></span>
+  <span class="right" id="stat"></span>
+</header>
+<main id="main"></main>
 <script>
-let sel = null, gates = [];
+'use strict';
+var runId = null, selSpan = null, gates = [], lastDetail = null;
 
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const j = async p => (await fetch(p)).json();
-const when = t => t ? new Date(t).toLocaleTimeString() : '';
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+function j(p) { return fetch(p).then(function(r){ return r.json(); }); }
+function dur(ms) {
+  if (ms < 0 || isNaN(ms)) return '';
+  var s = Math.round(ms/1000);
+  if (s < 90) return s + 's';
+  var m = Math.round(s/60); if (m < 90) return m + 'm';
+  var h = Math.floor(m/60); return h + 'h ' + (m - h*60) + 'm';
+}
+function usd(x) { return x ? '$' + x.toFixed(x < 0.1 ? 4 : 2) : ''; }
+function ago(t) { return dur(Date.now() - new Date(t)) }
+function clock(t) { return t ? new Date(t).toLocaleTimeString() : ''; }
 
-async function tick() {
-  try {
-    const [runs, g] = await Promise.all([j('/v1/runs'), j('/v1/gates')]);
-    gates = g || [];
-    document.getElementById('stat').textContent =
-      (runs?.length ?? 0) + ' runs · ' + gates.length + ' open gate(s) · ' + new Date().toLocaleTimeString();
-    renderRuns(runs || []);
-    if (sel) renderDetail(await j('/v1/runs/' + sel));
-  } catch (e) {
-    document.getElementById('stat').textContent = 'daemon unreachable: ' + e;
-  }
+function tick() {
+  Promise.all([j('/v1/runs'), j('/v1/gates')]).then(function(res) {
+    var runs = res[0] || []; gates = res[1] || [];
+    document.getElementById('stat').textContent = 'updated ' + new Date().toLocaleTimeString();
+    document.getElementById('gates-pill').innerHTML =
+      gates.length ? '<span class="gatepill">' + gates.length + ' gate' + (gates.length>1?'s':'') + ' waiting</span>' : '';
+    if (runId) {
+      j('/v1/runs/' + runId).then(function(d) { lastDetail = d; renderDetail(d); });
+    } else {
+      renderList(runs);
+    }
+  }).catch(function(e) {
+    document.getElementById('stat').textContent = 'daemon unreachable';
+  });
 }
 
-function renderRuns(runs) {
-  const el = document.getElementById('runs');
-  el.innerHTML = runs.map(r => ` + "`" + `
-    <div class="run ${r.ID===sel?'sel':''}" onclick="sel='${esc(r.ID)}';tick()">
-      <div><span class="id">${esc(r.ID)}</span></div>
-      <div>${esc(r.Workspace)}/${esc(r.Workflow)} · ${esc(r.State)}
-        <span class="badge s-${esc(r.Status)}">${esc(r.Status)}</span></div>
-    </div>` + "`" + `).join('') || '<div class="empty">no runs</div>';
+function openRun(id) { runId = id; selSpan = null; tick(); }
+function home() { runId = null; selSpan = null; tick(); }
+
+function renderList(runs) {
+  document.getElementById('crumb').textContent = 'runs';
+  var h = '';
+  if (gates.length) {
+    h += gates.map(function(g) { return gateBox(g, true); }).join('');
+  }
+  if (!runs.length) {
+    h += '<div class="empty">no runs yet</div>';
+  } else {
+    h += '<table class="runs"><tr><th>run</th><th>status</th><th>now</th><th style="text-align:right">cost</th><th style="text-align:right">age</th></tr>' +
+      runs.map(function(r) {
+        return '<tr class="r" onclick="openRun(\'' + esc(r.ID) + '\')">' +
+          '<td><span class="mono">' + esc(r.ID) + '</span><br><span class="faint">' + esc(r.Workspace) + ' / ' + esc(r.Workflow) + '</span></td>' +
+          '<td><span class="chip c-' + esc(r.Status) + '">' + esc(r.Status) + '</span></td>' +
+          '<td>' + esc(r.State) + '<br><span class="faint">for ' + ago(r.UpdatedAt) + '</span></td>' +
+          '<td class="num" id="cost-' + esc(r.ID) + '"></td>' +
+          '<td class="num dim">' + ago(r.CreatedAt) + '</td></tr>';
+      }).join('') + '</table>';
+  }
+  document.getElementById('main').innerHTML = h;
+}
+
+function gateBox(g, showRun) {
+  var att = (g.Payload || '').indexOf('needs attention') === 0;
+  return '<div class="gate' + (att ? ' att' : '') + '">' +
+    '<div class="q"><b>' + (att ? 'needs attention' : esc(g.Kind)) + '</b>' +
+    (showRun ? ' · <a onclick="openRun(\'' + esc(g.RunID) + '\')" class="mono">' + esc(g.RunID) + '</a>' : '') +
+    ' · ' + esc(g.Payload) +
+    (g.Options && g.Options.length ? ' <span class="dim">[' + esc(g.Options.join(' / ')) + ']</span>' : '') + '</div>' +
+    'answer: <code>krakoactl answer ' + esc(g.ID) + ' &lt;response&gt;</code></div>';
+}
+
+// Fold the event log into state visits: one waterfall row per stay in a state.
+function segments(events) {
+  var marks = {'run-admitted':'start','step-started':'agent','wait-armed':'wait','gate-opened':'gate','parked':'park'};
+  var segs = [], cur = null;
+  events.forEach(function(e) {
+    var type = marks[e.Kind];
+    if (!type || !e.State) return;
+    var t = +new Date(e.At);
+    if (cur && cur.state === e.State) {   // same visit: refine its type
+      if (cur.type === 'start' || (type === 'park')) cur.type = (type === 'start') ? cur.type : type;
+      if (cur.type === 'park' && type === 'gate') return;
+      if (type === 'agent') cur.attempts++;
+      return;
+    }
+    if (cur) cur.end = t;
+    cur = { state: e.State, type: type === 'start' ? 'agent' : type, start: t, end: null, attempts: type === 'agent' ? 1 : 0 };
+    segs.push(cur);
+  });
+  var last = events.length ? events[events.length-1] : null;
+  var done = events.some(function(e) { return e.Kind === 'run-finished'; });
+  if (cur && !cur.end) cur.end = done && last ? +new Date(last.At) : Date.now();
+  if (cur) cur.live = !done;
+  return segs;
 }
 
 function renderDetail(d) {
-  const r = d.run, steps = d.steps || [], events = d.events || [];
-  const agentOf = {};
-  events.forEach(e => { if (e.Kind === 'step-started' && e.Data) agentOf[e.Data.step] = e.Data.agent; });
-  const myGates = gates.filter(g => g.RunID === r.ID);
+  var r = d.run, steps = d.steps || [], events = d.events || [];
+  document.getElementById('crumb').innerHTML = '<a onclick="home()">runs</a> / <span class="mono">' + esc(r.ID) + '</span>';
 
-  let html = ` + "`" + `<div><span class="id" style="color:var(--acc)">${esc(r.ID)}</span>
-    · state <b>${esc(r.State)}</b> <span class="badge s-${esc(r.Status)}">${esc(r.Status)}</span><br>
-    <span class="meta" style="color:var(--dim)">def ${esc(r.DefHash)} · ws-git ${esc(r.WSVersion)} · started ${when(r.CreatedAt)}</span></div>` + "`" + `;
+  var agentOf = {};
+  events.forEach(function(e) { if (e.Kind === 'step-started' && e.Data) agentOf[e.Data.step] = e.Data.agent; });
+  var totalCost = steps.reduce(function(a, s) { return a + (s.CostUSD || 0); }, 0);
+  var started = +new Date(r.CreatedAt);
+  var done = events.some(function(e) { return e.Kind === 'run-finished'; });
+  var endT = done ? +new Date(events[events.length-1].At) : Date.now();
+  var myGates = gates.filter(function(g) { return g.RunID === r.ID; });
 
-  if (myGates.length) {
-    html += '<h2>open gates</h2>' + myGates.map(g => ` + "`" + `
-      <div class="gate ${g.Payload && g.Payload.startsWith('needs attention') ? 'att':''}">
-        <b>${esc(g.Kind)}</b> @ ${esc(g.State)}: ${esc(g.Payload)}<br>
-        ${g.Options?.length ? 'options: ' + esc(g.Options.join(' | ')) + '<br>' : ''}
-        answer: <code>krakoactl answer ${esc(g.ID)} &lt;response&gt;</code>
-      </div>` + "`" + `).join('');
+  var h = '<div class="runhead">' +
+    kv('status', '<span class="chip c-' + esc(r.Status) + '">' + esc(r.Status) + '</span>') +
+    kv('now', esc(r.State) + ' <span class="dim">for ' + ago(r.UpdatedAt) + '</span>') +
+    kv('duration', dur(endT - started)) +
+    kv('cost', usd(totalCost) || '—') +
+    kv('steps', String(steps.length)) +
+    '</div>';
+
+  h += myGates.map(function(g) { return gateBox(g, false); }).join('');
+
+  var segs = segments(events);
+  var t0 = segs.length ? segs[0].start : started;
+  var span = Math.max(endT - t0, 1);
+  h += '<div class="wf">' + segs.map(function(s, i) {
+    var st = stepFor(steps, s);
+    var left = (s.start - t0) / span * 100, width = (s.end - s.start) / span * 100;
+    var sub = s.type === 'agent' ? (st ? esc(agentOf[st.ID] || '') + (st.Attempt > 1 ? ' · attempt ' + st.Attempt : '') : '')
+            : s.type === 'wait' ? 'waiting' : s.type === 'gate' ? 'gate' : 'needs attention';
+    var right = dur(s.end - s.start) + (st && st.CostUSD ? ' · ' + usd(st.CostUSD) : '');
+    var outcome = st && st.Outcome ? ' → ' + esc(st.Outcome) : '';
+    return '<div class="row' + (selSpan === i ? ' sel' : '') + '" onclick="selSpan = (selSpan===' + i + ' ? null : ' + i + '); renderDetail(lastDetail)">' +
+      '<div class="name">' + esc(s.state) + outcome + '<div class="sub">' + sub + '</div></div>' +
+      '<div class="track"><div class="bar b-' + s.type + (s.live && i === segs.length-1 ? ' live' : '') + '" style="left:' + left + '%;width:' + Math.max(width, 1) + '%"></div></div>' +
+      '<div class="right">' + right + '</div></div>';
+  }).join('') + '</div>';
+
+  if (selSpan != null && segs[selSpan]) h += spanDetail(segs[selSpan], steps, agentOf, events);
+
+  h += '<details class="raw"><summary>raw events (' + events.length + ')</summary><table>' +
+    events.map(function(e) {
+      return '<tr><td class="dim">' + clock(e.At) + '</td><td>' + esc(e.Kind) + '</td><td>' + esc(e.State) + '</td>' +
+        '<td class="d">' + esc(Object.entries(e.Data || {}).map(function(p){ return p[0] + '=' + JSON.stringify(p[1]); }).join(' ')) + '</td></tr>';
+    }).join('') + '</table></details>';
+
+  document.getElementById('main').innerHTML = h;
+}
+
+function kv(k, v) { return '<div class="kv"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>'; }
+
+function stepFor(steps, seg) {
+  var best = null;
+  steps.forEach(function(s) {
+    var t = +new Date(s.StartedAt);
+    if (s.State === seg.state && t >= seg.start - 3000 && t <= seg.end + 1000) best = s;
+  });
+  return best;
+}
+
+function spanDetail(seg, steps, agentOf, events) {
+  var st = stepFor(steps, seg);
+  var h = '<div class="spandetail"><h3>' + esc(seg.state) + '</h3>';
+  if (st) {
+    h += '<div class="meta">' + esc(agentOf[st.ID] || '') + ' · attempt ' + st.Attempt +
+      (st.CostUSD ? ' · ' + usd(st.CostUSD) : '') +
+      (st.SessionID ? ' · session <span class="mono">' + esc(st.SessionID) + '</span>' : '') + '</div>';
+    if (st.SessionPath) h += '<div class="meta">resume: <span class="mono">claude --resume ' + esc(st.SessionID) + '</span> · transcript <span class="mono">' + esc(st.SessionPath) + '</span></div>';
+    if (st.Error) h += '<div class="err">' + esc(st.Error) + '</div>';
+    if (st.Inputs && Object.keys(st.Inputs).length) h += '<div class="lbl">inputs</div><pre>' + esc(JSON.stringify(st.Inputs, null, 2)) + '</pre>';
+    if (st.Result && Object.keys(st.Result).length) h += '<div class="lbl">result</div><pre>' + esc(JSON.stringify(st.Result, null, 2)) + '</pre>';
+  } else {
+    var evs = events.filter(function(e) { return e.State === seg.state; });
+    h += '<div class="lbl">events in this span</div><pre>' + esc(evs.map(function(e) {
+      return clock(e.At) + '  ' + e.Kind + '  ' + JSON.stringify(e.Data || {});
+    }).join('\n')) + '</pre>';
   }
-
-  html += '<h2>steps</h2>' + (steps.map(s => ` + "`" + `
-    <div class="step">
-      <b>${esc(s.State)}</b> · ${esc(agentOf[s.ID] || s.Kind)} · attempt ${s.Attempt}
-        → <b class="${s.Error?'err':''}">${esc(s.Outcome || (s.Error?'failed':'…'))}</b>
-      <div class="meta">
-        ${s.SessionID ? 'session ' + esc(s.SessionID) : ''}
-        ${s.CostUSD ? ' · $' + s.CostUSD.toFixed(4) : ''}
-        ${s.StartedAt ? ' · ' + when(s.StartedAt) : ''}
-      </div>
-      ${s.SessionPath ? '<div class="meta">' + esc(s.SessionPath) + '</div>' : ''}
-      ${s.Error ? '<div class="err">' + esc(s.Error) + '</div>' : ''}
-    </div>` + "`" + `).join('') || '<div class="empty">none yet</div>');
-
-  html += '<h2>timeline</h2><table>' + events.map(e => ` + "`" + `
-    <tr><td class="t">${when(e.At)}</td><td>${esc(e.Kind)}</td><td>${esc(e.State)}</td>
-    <td class="data">${esc(Object.entries(e.Data||{}).map(([k,v])=>k+'='+JSON.stringify(v)).join(' '))}</td></tr>` + "`" + `).join('') + '</table>';
-
-  document.getElementById('detail').innerHTML = html;
+  return h + '</div>';
 }
 
 tick();
-setInterval(tick, 3000);
+setInterval(tick, 4000);
 </script>
 </body>
 </html>`

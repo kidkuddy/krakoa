@@ -129,7 +129,7 @@ type synthRunner struct {
 
 func (r *synthRunner) Run(_ context.Context, req runner.Request) (*runner.Result, error) {
 	st := r.def.States[req.State]
-	outcome := bestOutcome(st.On, r.dist)
+	outcome := bestOutcome(r.def, st.On, r.dist)
 	result := map[string]any{"outcome": outcome}
 	for _, f := range r.fields[req.State] {
 		setPath(result, strings.Split(f, "."), "dry-"+f)
@@ -144,22 +144,37 @@ func (r *synthRunner) Run(_ context.Context, req runner.Request) (*runner.Result
 	return &runner.Result{SessionID: "dry-run"}, nil
 }
 
-func bestOutcome(on map[string]string, dist map[string]int) string {
+// bestOutcome prefers the shortest path to a terminal through NON-gate
+// targets — failure/question gates on short paths must not seduce the walk
+// off the main line (a dispatch-failed -> gate -> abandoned exit is 2 hops;
+// the happy tail is 5). Gate targets are the fallback when nothing else
+// leads anywhere.
+func bestOutcome(def *core.WorkflowDefinition, on map[string]string, dist map[string]int) string {
 	outcomes := make([]string, 0, len(on))
 	for o := range on {
 		outcomes = append(outcomes, o)
 	}
 	sort.Strings(outcomes)
-	best, bestD := "", 1<<30
-	for _, o := range outcomes {
-		if d, ok := dist[on[o]]; ok && d < bestD {
-			best, bestD = o, d
+	pick := func(allowGate bool) string {
+		best, bestD := "", 1<<30
+		for _, o := range outcomes {
+			target := on[o]
+			if !allowGate && def.States[target].Step == core.StepGate {
+				continue
+			}
+			if d, ok := dist[target]; ok && d < bestD {
+				best, bestD = o, d
+			}
 		}
+		return best
 	}
-	if best == "" {
-		return outcomes[0]
+	if best := pick(false); best != "" {
+		return best
 	}
-	return best
+	if best := pick(true); best != "" {
+		return best
+	}
+	return outcomes[0]
 }
 
 func autoAnswer(def *core.WorkflowDefinition, run *core.Run, g *core.Gate, dist map[string]int) (string, map[string]any) {
@@ -201,6 +216,9 @@ func bestArm(def *core.WorkflowDefinition, st core.State, dist map[string]int, v
 		if d, ok := dist[target]; ok {
 			if visited[target] {
 				d += 1000
+			}
+			if def.States[target].Step == core.StepGate {
+				d += 500 // prefer non-gate arms; see bestOutcome
 			}
 			if d < bestD {
 				best, bestD = arm, d
