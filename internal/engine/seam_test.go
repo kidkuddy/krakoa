@@ -757,3 +757,32 @@ func TestCommandWatcherSweepsAndCommandProbeAdvances(t *testing.T) {
 		t.Fatalf("expected bad-watch strike gate, got %+v", gates)
 	}
 }
+
+// Answers accumulate across gate rounds: round 3 must still carry round 1's
+// decisions, or the verifier re-asks settled questions.
+func TestQuestionGateAnswersAccumulate(t *testing.T) {
+	v := setup(t)
+	fr := v.run
+	for i := 0; i < 3; i++ {
+		fr.on("refining", ok("outcome", "ok", "ticket", "d"))
+		fr.on("grounding", ok("outcome", "ungrounded", "questions", []any{"q"}))
+	}
+	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := v.openGate(t, run.ID)
+	if err := v.eng.AnswerGate(g.ID, "answered", map[string]any{"direction": "inbound only"}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	g = v.openGate(t, run.ID)
+	if err := v.eng.AnswerGate(g.ID, "answered", map[string]any{"revision": "pin latest"}, "test"); err != nil {
+		t.Fatal(err)
+	}
+	r := v.mustRun(t, run.ID)
+	asking, _ := r.Context["asking"].(map[string]any)
+	answers, _ := asking["answers"].(map[string]any)
+	if answers["direction"] != "inbound only" || answers["revision"] != "pin latest" {
+		t.Fatalf("answers did not accumulate: %+v", answers)
+	}
+}

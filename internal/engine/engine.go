@@ -322,7 +322,22 @@ func (e *Engine) answerGateLocked(gateID, response string, answers map[string]an
 	result := map[string]any{"response": response}
 	if g.Kind == core.GateQuestion {
 		outcome = "answered"
-		result["answers"] = answers
+		// Answers ACCUMULATE across every round of this gate for the life
+		// of the run — each round asks new questions, but earlier decisions
+		// stay settled (found live: round 3 overwrote round 1's answers and
+		// the verifier re-asked them verbatim).
+		merged := map[string]any{}
+		if prev, ok := run.Context[g.State].(map[string]any); ok {
+			if prevAnswers, ok := prev["answers"].(map[string]any); ok {
+				for k, v := range prevAnswers {
+					merged[k] = v
+				}
+			}
+		}
+		for k, v := range answers {
+			merged[k] = v
+		}
+		result["answers"] = merged
 	}
 	if g.Kind == core.GateApproval && response != "approved" {
 		outcome = "rejected"
