@@ -28,6 +28,7 @@ const usage = `usage: krakoactl <command> [args]
   emit <event> --workspace <ws> [--key k] [--run id] [--payload json]
   workspace validate <path>                          load + validate a workspace dir
   workspace dry-run <path> <workflow>                simulate a workflow end to end
+  doctor                                             check live-run prerequisites
 
 env: KRAKOA_ADDR (default http://127.0.0.1:7770)
 `
@@ -53,6 +54,8 @@ func main() {
 		err = cmdEmit(os.Args[2:])
 	case "workspace":
 		err = cmdWorkspace(os.Args[2:])
+	case "doctor":
+		err = cmdDoctor()
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
