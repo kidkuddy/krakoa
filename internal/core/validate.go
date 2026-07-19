@@ -113,8 +113,11 @@ func Validate(def *WorkflowDefinition) []error {
 				}
 				if arm.Probe != nil {
 					set++
-					if arm.Probe.Agent == "" || arm.Probe.Every <= 0 {
-						fail("state %s: arm %d probe requires agent and every", name, i)
+					if (arm.Probe.Agent == "") == (arm.Probe.Command == "") {
+						fail("state %s: arm %d probe requires exactly one of agent/command", name, i)
+					}
+					if arm.Probe.Every <= 0 {
+						fail("state %s: arm %d probe requires every", name, i)
 					}
 				}
 				if set != 1 {

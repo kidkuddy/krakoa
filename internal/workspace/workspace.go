@@ -147,8 +147,17 @@ func Load(path string) (*Workspace, []error) {
 		if w.Every <= 0 {
 			fail("watcher %s: every is required", w.Name)
 		}
-		if _, ok := ws.Agents[w.Agent]; !ok {
-			fail("watcher %s: unknown agent %q", w.Name, w.Agent)
+		switch {
+		case (w.Agent == "") == (w.Command == ""):
+			fail("watcher %s: exactly one of agent/command required", w.Name)
+		case w.Agent != "":
+			if _, ok := ws.Agents[w.Agent]; !ok {
+				fail("watcher %s: unknown agent %q", w.Name, w.Agent)
+			}
+		default:
+			if err := checkScript(path, w.Command); err != nil {
+				fail("watcher %s: %v", w.Name, err)
+			}
 		}
 		ws.Watchers[w.Name] = &w
 	}
@@ -228,10 +237,15 @@ func (ws *Workspace) checkRefs(def *core.WorkflowDefinition) []error {
 			}
 		}
 		for _, arm := range st.Arms {
-			if arm.Probe != nil {
+			if arm.Probe == nil {
+				continue
+			}
+			if arm.Probe.Agent != "" {
 				if _, ok := ws.Agents[arm.Probe.Agent]; !ok {
 					fail("state %s: unknown probe agent %q", name, arm.Probe.Agent)
 				}
+			} else if err := checkScript(ws.Path, arm.Probe.Command); err != nil {
+				fail("state %s: %v", name, err)
 			}
 		}
 	}
@@ -274,6 +288,25 @@ func contains(xs []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// checkScript validates a command probe reference: its first token must be
+// an existing, executable, workspace-relative file ($-templates in later
+// args are fine — they resolve at fire time).
+func checkScript(wsPath, command string) error {
+	tok := strings.Fields(command)
+	if len(tok) == 0 {
+		return fmt.Errorf("empty command")
+	}
+	p := filepath.Join(wsPath, tok[0])
+	fi, err := os.Stat(p)
+	if err != nil {
+		return fmt.Errorf("command script %q not found in workspace", tok[0])
+	}
+	if fi.IsDir() || fi.Mode()&0o111 == 0 {
+		return fmt.Errorf("command script %q is not executable", tok[0])
+	}
+	return nil
 }
 
 func gitVersion(path string) string {

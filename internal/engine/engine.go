@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -48,7 +50,24 @@ type Engine struct {
 	// e.mu is held.
 	pending []func()
 
+	// watcherFails counts consecutive derailed sweeps per "ws/watcher";
+	// in-memory by design (a restart resets the strike count, the cadence
+	// keeps sweeping).
+	watcherFails map[string]int
+
+	// Exec runs a deterministic command probe (cwd = workspace dir) and
+	// returns its stdout. Overridable for dry-run and tests.
+	Exec func(dir, command string) ([]byte, error)
+
 	Log *log.Logger
+}
+
+func realExec(dir, command string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	cmd.Dir = dir
+	return cmd.Output()
 }
 
 // drain dispatches queued jobs without holding the lock. Every public entry
@@ -69,13 +88,15 @@ func (e *Engine) drain() {
 
 func New(st *store.Store, rn runner.Runner, clk Clock, wss map[string]*workspace.Workspace, dataDir string) *Engine {
 	return &Engine{
-		Store:      st,
-		Runner:     rn,
-		Clock:      clk,
-		Workspaces: wss,
-		DataDir:    dataDir,
-		Spawn:      func(f func()) { go f() },
-		Log:        log.New(os.Stdout, "", log.LstdFlags),
+		Store:        st,
+		Runner:       rn,
+		Clock:        clk,
+		Workspaces:   wss,
+		DataDir:      dataDir,
+		Spawn:        func(f func()) { go f() },
+		watcherFails: map[string]int{},
+		Exec:         realExec,
+		Log:          log.New(os.Stdout, "", log.LstdFlags),
 	}
 }
 
@@ -278,6 +299,9 @@ func (e *Engine) answerGateLocked(gateID, response string, answers map[string]an
 	}
 	e.event(g.RunID, g.State, "gate-answered", map[string]any{"gate": gateID, "response": response, "responder": responder}, g.Workspace)
 
+	if g.RunID == "" {
+		return nil // engine-level gate (e.g. watcher failures): ack is enough
+	}
 	run, err := e.Store.GetRun(g.RunID)
 	if err != nil {
 		return err
@@ -486,13 +510,55 @@ type EmittedEvent struct {
 }
 
 // HandleEmit routes one event: direct run targeting, waiting-run correlation,
-// mid-state buffering — in that order. Returns what happened (for logs).
+// mid-state buffering — and, exactly like a watcher observation, an event a
+// spawn-mode watcher declares interest in spawns a run (dedupe included).
+// Manual emit is the operator's replay/recovery tool; it must not be weaker
+// than the watcher path. Returns what happened (for logs).
 func (e *Engine) HandleEmit(wsName string, ev EmittedEvent) string {
 	e.mu.Lock()
 	out := e.routeEventLocked(wsName, ev)
+	if out == "no matching run" {
+		if spawned := e.spawnFromEventLocked(wsName, ev); spawned != "" {
+			out = spawned
+		}
+	}
 	e.mu.Unlock()
 	e.drain()
 	return out
+}
+
+// spawnFromEventLocked spawns a run for an event some spawn-mode watcher
+// declares (dedupe against that watcher's keys). Empty string = no taker.
+func (e *Engine) spawnFromEventLocked(wsName string, ev EmittedEvent) string {
+	ws := e.Workspaces[wsName]
+	if ws == nil {
+		return ""
+	}
+	names := make([]string, 0, len(ws.Watchers))
+	for n := range ws.Watchers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		w := ws.Watchers[n]
+		if w.Mode != "spawn" || !spawnable(w, ev.Event) {
+			continue
+		}
+		if ev.Key != "" {
+			if seen, _ := e.Store.DedupeSeen(n, ev.Key); seen {
+				return "duplicate (already handled by watcher " + n + ")"
+			}
+		}
+		run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, "")
+		if err != nil {
+			return "spawn failed: " + err.Error()
+		}
+		if ev.Key != "" {
+			e.Store.DedupeMark(n, ev.Key, e.Clock.Now())
+		}
+		return "spawned " + run.ID
+	}
+	return ""
 }
 
 func (e *Engine) routeEventLocked(wsName string, ev EmittedEvent) string {

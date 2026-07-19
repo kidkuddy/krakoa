@@ -67,7 +67,12 @@ func (c *Claude) Run(ctx context.Context, req Request) (*Result, error) {
 		prompt = req.ResumeMessage
 		args = append(args, "--resume", req.Resume)
 	}
-	args = append(args, "-p", prompt, "--output-format", "json", "--dangerously-skip-permissions")
+	// --setting-sources project: NEVER load the user's global CLAUDE.md,
+	// settings, or hooks — a live probe once obeyed a user-global mandate,
+	// asked a question into the void, and skipped its sweep. Only the
+	// agent-home persona and carried skills may steer a step.
+	args = append(args, "-p", prompt, "--output-format", "json",
+		"--dangerously-skip-permissions", "--setting-sources", "project")
 	if m := req.Spec.Model; m != "" {
 		args = append(args, "--model", m)
 	}

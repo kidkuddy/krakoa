@@ -50,11 +50,17 @@ type GateSpec struct {
 	Options []string `yaml:"options,omitempty"`
 }
 
-// ProbeSpec is a cheap agent probe evaluated on a cadence inside a wait arm.
+// ProbeSpec is a probe evaluated on a cadence inside a wait arm: either a
+// cheap agent (judgment) or a deterministic workspace command (pure
+// observation — no LLM, no session, no cost). Exactly one of Agent/Command.
 type ProbeSpec struct {
-	Agent       string   `yaml:"agent"`
-	Instruction string   `yaml:"instruction"`
-	Every       Duration `yaml:"every"`
+	Agent       string `yaml:"agent,omitempty"`
+	Instruction string `yaml:"instruction,omitempty"`
+	// Command is a workspace-relative script invocation (templates allowed,
+	// e.g. "scripts/pipeline-check $merging.merge_sha"); it must print the
+	// probe result JSON on stdout.
+	Command string   `yaml:"command,omitempty"`
+	Every   Duration `yaml:"every"`
 }
 
 // WaitArm is one arm of a wait state; first to fire wins.
@@ -119,14 +125,19 @@ type AgentSpec struct {
 	ResultSchema  string   `yaml:"result_schema,omitempty"` // JSON Schema for result.json
 }
 
-// WatcherSpec is a scheduled probe agent emitting deduped events.
+// WatcherSpec is a scheduled probe emitting deduped events: an agent probe
+// (judgment) or a deterministic workspace command (pure observation).
+// Exactly one of Agent/Command.
 type WatcherSpec struct {
-	Name        string   `yaml:"name"`
-	Agent       string   `yaml:"agent"`
-	Instruction string   `yaml:"instruction,omitempty"`
-	Every       Duration `yaml:"every"`
-	Mode        string   `yaml:"mode"`               // spawn | resume
-	Workflow    string   `yaml:"workflow,omitempty"` // spawn mode: workflow to start
+	Name        string `yaml:"name"`
+	Agent       string `yaml:"agent,omitempty"`
+	Instruction string `yaml:"instruction,omitempty"`
+	// Command is a workspace-relative script printing the observations JSON
+	// ({"outcome":"ok","events":[...]}) on stdout.
+	Command  string   `yaml:"command,omitempty"`
+	Every    Duration `yaml:"every"`
+	Mode     string   `yaml:"mode"`               // spawn | resume
+	Workflow string   `yaml:"workflow,omitempty"` // spawn mode: workflow to start
 	// SpawnOn lists the event names that spawn runs (spawn mode); other
 	// events route as correlation resumes. Empty = every unmatched event
 	// spawns.

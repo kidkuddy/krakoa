@@ -43,12 +43,19 @@ const uiHTML = `<!doctype html>
   .c-done    { background:rgba(63,185,80,.15); color:var(--green); }
   .c-failed, .c-needs-attention, .c-canceled { background:rgba(248,81,73,.15); color:var(--red); }
 
-  table.runs { width:100%; border-collapse:collapse; }
-  .runs th { text-align:left; color:var(--faint); font-size:11px; text-transform:uppercase;
-             letter-spacing:.8px; font-weight:600; padding:6px 10px; border-bottom:1px solid var(--line); }
-  .runs td { padding:9px 10px; border-bottom:1px solid var(--line); }
-  .runs tr.r:hover { background:var(--panel); cursor:pointer; }
-  .runs .num { text-align:right; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  /* compact run cards */
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:6px;
+          padding:12px 14px; cursor:pointer; }
+  .card:hover { border-color:var(--faint); }
+  .card.parked { border-color:rgba(212,167,44,.55); }
+  .card.att { border-color:rgba(248,81,73,.6); }
+  .card .top { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+  .card .wf { color:var(--dim); font-size:12px; }
+  .card .now { margin-top:8px; font-size:14px; }
+  .card .facts { display:flex; gap:14px; margin-top:8px; color:var(--faint); font-size:12px; }
+  .card .unblock { margin-top:10px; border-top:1px solid var(--line); padding-top:8px; font-size:12px; }
+  .card .unblock code { background:var(--panel2); padding:2px 6px; border-radius:4px; user-select:all; }
   .dim { color:var(--dim); } .faint { color:var(--faint); }
 
   .gate { border:1px solid rgba(212,167,44,.5); background:rgba(212,167,44,.07);
@@ -206,32 +213,57 @@ function tick() {
   });
 }
 
-function openRun(id) { runId = id; selKey = null; tick(); }
-function home() { runId = null; selKey = null; tick(); }
-function selectNode(k) { selKey = k; if (lastDetail) renderDetail(lastDetail); }
+/* view state persists in the URL hash so a refresh restores it */
+function syncHash() {
+  var h = runId ? '#r=' + encodeURIComponent(runId) + (selKey ? '&s=' + encodeURIComponent(selKey) : '') : '';
+  if (location.hash !== h) history.replaceState(null, '', location.pathname + h);
+}
+function loadHash() {
+  var m = location.hash.match(/^#r=([^&]+)(?:&s=(.+))?$/);
+  runId = m ? decodeURIComponent(m[1]) : null;
+  selKey = m && m[2] ? decodeURIComponent(m[2]) : null;
+}
+window.addEventListener('hashchange', function() { loadHash(); tick(); });
+
+function openRun(id) { runId = id; selKey = null; syncHash(); tick(); }
+function home() { runId = null; selKey = null; syncHash(); tick(); }
+function selectNode(k) { selKey = k; syncHash(); if (lastDetail) renderDetail(lastDetail); }
 
 function renderList(runs) {
   document.getElementById('crumb').textContent = 'runs';
-  var h = gates.map(function(g) { return gateBox(g, true); }).join('');
+  var h = '';
   if (!runs.length) {
     h += '<div class="empty">no runs yet</div>';
   } else {
-    h += '<table class="runs"><tr><th>run</th><th>status</th><th>now</th><th style="text-align:right">cost</th><th style="text-align:right">age</th></tr>' +
-      runs.map(function(r) {
-        return '<tr class="r" onclick="openRun(\'' + esc(r.ID) + '\')">' +
-          '<td><span class="mono">' + esc(r.ID) + '</span><br><span class="faint">' + esc(r.Workspace) + ' / ' + esc(r.Workflow) + '</span></td>' +
-          '<td><span class="chip c-' + esc(r.Status) + '">' + esc(r.Status) + '</span></td>' +
-          '<td>' + esc(r.State) + '<br><span class="faint">for ' + ago(r.UpdatedAt) + '</span></td>' +
-          '<td class="num" id="cost-' + esc(r.ID) + '"></td>' +
-          '<td class="num dim">' + ago(r.CreatedAt) + '</td></tr>';
-      }).join('') + '</table>';
+    var gateByRun = {};
+    gates.forEach(function(g) { gateByRun[g.RunID] = g; });
+    h += '<div class="cards">' + runs.map(function(r) {
+      var g = gateByRun[r.ID];
+      var att = r.Status === 'needs-attention' || r.Status === 'failed';
+      var parked = r.Status === 'gated' || r.Status === 'waiting';
+      var card = '<div class="card' + (att ? ' att' : (g ? ' parked' : '')) + '" onclick="openRun(\'' + esc(r.ID) + '\')">' +
+        '<div class="top"><span class="mono">' + esc(r.ID) + '</span>' +
+        '<span class="chip c-' + esc(r.Status) + '">' + esc(r.Status) + '</span></div>' +
+        '<div class="wf">' + esc(r.Workspace) + ' / ' + esc(r.Workflow) + '</div>' +
+        '<div class="now">' + esc(r.State) + ' <span class="faint">for ' + ago(r.UpdatedAt) + '</span></div>' +
+        '<div class="facts"><span>age ' + ago(r.CreatedAt) + '</span><span id="cost-' + esc(r.ID) + '"></span></div>';
+      if (g) {
+        card += '<div class="unblock">' + esc(g.Payload).slice(0, 140) +
+          (g.Options && g.Options.length ? ' <span class="dim">[' + esc(g.Options.join(' / ')) + ']</span>' : '') +
+          '<br>unblock: <code onclick="event.stopPropagation()">krakoactl answer ' + esc(g.ID) + ' &lt;response&gt;</code></div>';
+      }
+      return card + '</div>';
+    }).join('') + '</div>';
+    // engine-level gates (no run behind them, e.g. watcher failures)
+    gates.filter(function(g) { return !g.RunID; }).forEach(function(g) { h = gateBox(g, false) + h; });
   }
   document.getElementById('main').innerHTML = h;
-  runs.slice(0, 20).forEach(function(r) {
+  runs.slice(0, 24).forEach(function(r) {
     j('/v1/runs/' + r.ID).then(function(d) {
       var el = document.getElementById('cost-' + r.ID);
       if (!el) return;
-      el.textContent = usd((d.steps || []).reduce(function(a, s) { return a + (s.CostUSD || 0); }, 0));
+      var c = (d.steps || []).reduce(function(a, s) { return a + (s.CostUSD || 0); }, 0);
+      el.textContent = c ? usd(c) : '';
     });
   });
 }
@@ -394,6 +426,7 @@ function nodeContent(seg, steps, agentOf, events) {
   return h;
 }
 
+loadHash();
 tick();
 setInterval(tick, 4000);
 </script>

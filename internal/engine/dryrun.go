@@ -19,31 +19,101 @@ import (
 	"github.com/kidkuddy/krakoa/internal/workspace"
 )
 
-// DryRun executes one simulated run of a workflow against a synthetic runner
-// and an in-memory store: outcomes are chosen by shortest path to a terminal
-// state, agent results synthesize every $state.field the definition
-// references, gates auto-answer, waits fire their best arm. It proves the
-// definition actually executes (templates resolve, transitions route,
-// budgets hold) without touching the world.
+// DryRun proves a workflow executes without touching the world: synthetic
+// runner, in-memory store, auto-answered gates, auto-fired waits. It walks
+// EVERY declared transition edge at least once — the happy path first, then
+// one steered simulation per still-uncovered edge (sad paths, loops, and
+// timeout arms included; a budget park hit while looping IS that edge
+// working). Unwalkable edges fail the dry-run.
 func DryRun(ws *workspace.Workspace, wfName string, out io.Writer) error {
 	def, ok := ws.Workflows[wfName]
 	if !ok {
 		return fmt.Errorf("unknown workflow %q", wfName)
 	}
+
+	// declared edges
+	var edges []string
+	for name, st := range def.States {
+		for o := range st.On {
+			edges = append(edges, name+"/"+o)
+		}
+	}
+	sort.Strings(edges)
+	covered := map[string]bool{}
+
+	fmt.Fprintf(out, "happy path:\n")
+	if err := dryWalk(ws, def, nil, covered, out); err != nil {
+		return err
+	}
+
+	for _, edge := range edges {
+		if covered[edge] {
+			continue
+		}
+		parts := strings.SplitN(edge, "/", 2)
+		fmt.Fprintf(out, "forcing edge %s:\n", edge)
+		if err := dryWalk(ws, def, &target{state: parts[0], outcome: parts[1]}, covered, out); err != nil {
+			return fmt.Errorf("edge %s: %w", edge, err)
+		}
+		if !covered[edge] {
+			return fmt.Errorf("edge %s is unwalkable: the steered simulation never traversed it", edge)
+		}
+	}
+	fmt.Fprintf(out, "dry-run OK: all %d transition edges walked\n", len(edges))
+	return nil
+}
+
+// target steers one simulation: reach state, take outcome, then head home.
+type target struct {
+	state   string
+	outcome string
+	taken   bool
+}
+
+// dryWalk runs one simulation. A run that ends done, failed, or parked is a
+// valid walk (parks exercise budgets and failure gates); only a stuck or
+// non-terminating sim is an error.
+func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target, covered map[string]bool, out io.Writer) error {
 	st, err := store.Open(":memory:")
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	dist := distanceToTerminal(def)
-	fields := referencedFields(def)
+	// Homeward distances exclude timeout edges: stall-gates would otherwise
+	// look like shortcuts and trap the walk in wait loops. Steering
+	// distances keep every edge — reaching a sad state may need a timeout.
+	distEnd := distanceTo(def, false, terminalStates(def)...)
+	var distTgt map[string]int
+	if tgt != nil {
+		distTgt = distanceTo(def, true, tgt.state)
+	}
+	choose := func(state string, on map[string]string) string {
+		if tgt != nil && !tgt.taken && state == tgt.state {
+			tgt.taken = true
+			return tgt.outcome
+		}
+		if tgt != nil && !tgt.taken {
+			return bestByDist(def, on, distTgt, false)
+		}
+		return bestByDist(def, on, distEnd, true)
+	}
+	record := func(state, outcome string) { covered[state+"/"+outcome] = true }
+
 	clk := &settableClock{t: time.Now()}
-	rn := &synthRunner{def: def, dist: dist, fields: fields}
+	rn := &synthRunner{def: def, choose: choose, record: record, fields: referencedFields(def)}
 	eng := New(st, rn, clk, map[string]*workspace.Workspace{ws.Name: ws}, os.TempDir())
 	eng.Spawn = func(f func()) { f() }
 	eng.Log = log.New(io.Discard, "", 0)
-	rn.eng = eng
+	// Command probes must never execute real workspace scripts in a dry
+	// run — the synthetic exec picks the walk's outcome instead.
+	probeState := ""
+	eng.Exec = func(dir, command string) ([]byte, error) {
+		outcome := choose(probeState, def.States[probeState].On)
+		record(probeState, outcome)
+		raw, _ := json.Marshal(map[string]any{"outcome": outcome, "url": "dry-url", "status": "dry"})
+		return raw, nil
+	}
 
 	inputs := map[string]any{}
 	for name, spec := range def.Inputs {
@@ -51,66 +121,81 @@ func DryRun(ws *workspace.Workspace, wfName string, out io.Writer) error {
 			inputs[name] = "dry-" + name
 		}
 	}
-	run, err := eng.StartRun(ws.Name, wfName, inputs, "")
+	run, err := eng.StartRun(ws.Name, def.Name, inputs, "")
 	if err != nil {
 		return err
 	}
 
-	visited := map[string]bool{}
 	for i := 0; i < 200; i++ {
 		cur, err := st.GetRun(run.ID)
 		if err != nil {
 			return err
 		}
-		visited[cur.State] = true
 		switch cur.Status {
 		case core.StatusDone:
-			fmt.Fprintf(out, "dry-run OK: reached terminal state %q\n", cur.State)
-			printTrace(out, st, run.ID)
+			fmt.Fprintf(out, "  -> terminal %q\n", cur.State)
 			return nil
 		case core.StatusFailed, core.StatusCanceled:
-			printTrace(out, st, run.ID)
-			return fmt.Errorf("dry-run ended %s in state %s", cur.Status, cur.State)
+			fmt.Fprintf(out, "  -> ended %s in %q\n", cur.Status, cur.State)
+			return nil
 		case core.StatusNeedsAttention:
 			g, _ := st.OpenGateForRun(run.ID)
 			reason := ""
 			if g != nil {
 				reason = g.Payload
 			}
-			printTrace(out, st, run.ID)
-			return fmt.Errorf("dry-run parked in %s: %s", cur.State, reason)
+			fmt.Fprintf(out, "  -> parked in %q (%s)\n", cur.State, reason)
+			// budget parks are legitimate walks; template failures are
+			// definition bugs and must fail the dry-run
+			if strings.Contains(reason, "resolve $") {
+				return fmt.Errorf("template failure: %s", reason)
+			}
+			return nil
 		case core.StatusGated:
 			g, _ := st.OpenGateForRun(run.ID)
 			if g == nil {
 				return fmt.Errorf("gated but no open gate")
 			}
-			resp, answers := autoAnswer(def, cur, g, dist)
-			fmt.Fprintf(out, "  gate %s (%s): %q -> answering %q\n", g.State, g.Kind, g.Payload, resp)
+			resp, outcome, answers := gateChoice(def, cur, g, choose)
+			record(cur.State, outcome)
+			fmt.Fprintf(out, "  gate %s: answering %q\n", g.State, resp)
 			if err := eng.AnswerGate(g.ID, resp, answers, "dry-run"); err != nil {
 				return err
 			}
 		case core.StatusWaiting:
 			state := def.States[cur.State]
-			arm, timeout := bestArm(def, state, dist, visited)
-			if arm != nil {
+			// Probe-armed waits fire their probe; the synthetic probe (agent
+			// or command) makes the walk's choice itself — including
+			// "timeout", which lands on the same edge as the timer would.
+			if p := firstProbe(state); p != nil {
+				probeState = cur.State
+				fmt.Fprintf(out, "  wait %s: firing probe\n", cur.State)
+				clk.Advance(p.Every.D() + time.Second)
+				eng.Tick()
+				continue
+			}
+			outcome := choose(cur.State, state.On)
+			if arm := armFor(state, outcome); arm != nil {
 				key := ""
 				if arm.Correlate != "" {
 					if v, err := core.Resolve(cur, arm.Correlate); err == nil {
 						key = fmt.Sprintf("%v", v)
 					}
 				}
-				fmt.Fprintf(out, "  wait %s: firing event %q (key %q)\n", cur.State, arm.Event, key)
+				record(cur.State, outcome)
+				fmt.Fprintf(out, "  wait %s: firing event %q\n", cur.State, arm.Event)
 				eng.HandleEmit(ws.Name, EmittedEvent{Event: arm.Event, Key: key})
 			} else {
-				fmt.Fprintf(out, "  wait %s: no event arm, firing timeout after %s\n", cur.State, timeout)
-				clk.Advance(timeout + time.Second)
+				record(cur.State, "timeout")
+				fmt.Fprintf(out, "  wait %s: firing timeout\n", cur.State)
+				clk.Advance(maxTimeout(state) + time.Second)
 				eng.Tick()
 			}
 		case core.StatusRunning, core.StatusQueued:
-			return fmt.Errorf("dry-run stuck %s in state %s", cur.Status, cur.State)
+			return fmt.Errorf("stuck %s in state %s", cur.Status, cur.State)
 		}
 	}
-	return fmt.Errorf("dry-run did not terminate within 200 iterations")
+	return fmt.Errorf("did not terminate within 200 iterations")
 }
 
 type settableClock struct{ t time.Time }
@@ -118,18 +203,19 @@ type settableClock struct{ t time.Time }
 func (c *settableClock) Now() time.Time          { return c.t }
 func (c *settableClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
 
-// synthRunner picks the outcome whose target is closest to a terminal and
-// synthesizes every field later templates reference on this state.
+// synthRunner picks outcomes via the walk's chooser and synthesizes every
+// $state.field the definition references.
 type synthRunner struct {
 	def    *core.WorkflowDefinition
-	dist   map[string]int
+	choose func(state string, on map[string]string) string
+	record func(state, outcome string)
 	fields map[string][]string
-	eng    *Engine
 }
 
 func (r *synthRunner) Run(_ context.Context, req runner.Request) (*runner.Result, error) {
 	st := r.def.States[req.State]
-	outcome := bestOutcome(r.def, st.On, r.dist)
+	outcome := r.choose(req.State, st.On)
+	r.record(req.State, outcome)
 	result := map[string]any{"outcome": outcome}
 	for _, f := range r.fields[req.State] {
 		setPath(result, strings.Split(f, "."), "dry-"+f)
@@ -144,12 +230,10 @@ func (r *synthRunner) Run(_ context.Context, req runner.Request) (*runner.Result
 	return &runner.Result{SessionID: "dry-run"}, nil
 }
 
-// bestOutcome prefers the shortest path to a terminal through NON-gate
-// targets — failure/question gates on short paths must not seduce the walk
-// off the main line (a dispatch-failed -> gate -> abandoned exit is 2 hops;
-// the happy tail is 5). Gate targets are the fallback when nothing else
-// leads anywhere.
-func bestOutcome(def *core.WorkflowDefinition, on map[string]string, dist map[string]int) string {
+// bestByDist picks the outcome whose target minimizes dist. With avoidGates,
+// gate targets only win when nothing else leads anywhere (failure gates on
+// short paths must not seduce the homeward walk off the main line).
+func bestByDist(def *core.WorkflowDefinition, on map[string]string, dist map[string]int, avoidGates bool) string {
 	outcomes := make([]string, 0, len(on))
 	for o := range on {
 		outcomes = append(outcomes, o)
@@ -158,96 +242,100 @@ func bestOutcome(def *core.WorkflowDefinition, on map[string]string, dist map[st
 	pick := func(allowGate bool) string {
 		best, bestD := "", 1<<30
 		for _, o := range outcomes {
-			target := on[o]
-			if !allowGate && def.States[target].Step == core.StepGate {
+			t := on[o]
+			if !allowGate && def.States[t].Step == core.StepGate {
 				continue
 			}
-			if d, ok := dist[target]; ok && d < bestD {
+			if d, ok := dist[t]; ok && d < bestD {
 				best, bestD = o, d
 			}
 		}
 		return best
 	}
-	if best := pick(false); best != "" {
-		return best
+	if avoidGates {
+		if b := pick(false); b != "" {
+			return b
+		}
 	}
-	if best := pick(true); best != "" {
-		return best
+	if b := pick(true); b != "" {
+		return b
 	}
 	return outcomes[0]
 }
 
-func autoAnswer(def *core.WorkflowDefinition, run *core.Run, g *core.Gate, dist map[string]int) (string, map[string]any) {
+// gateChoice maps the walk's chosen outcome back to a gate response.
+func gateChoice(def *core.WorkflowDefinition, run *core.Run, g *core.Gate, choose func(string, map[string]string) string) (resp, outcome string, answers map[string]any) {
+	st := def.States[run.State]
+	outcome = choose(run.State, st.On)
 	switch g.Kind {
 	case core.GateQuestion:
-		return "answered", map[string]any{"dry-run": "synthetic answer"}
+		return "answered", "answered", map[string]any{"dry-run": "synthetic answer"}
 	case core.GateApproval:
-		return "approved", nil
-	default: // choice: option leading closest to a terminal
-		st := def.States[run.State]
-		best, bestD := g.Options[0], 1<<30
-		for _, opt := range g.Options {
-			if target, ok := st.On[opt]; ok {
-				if d, ok := dist[target]; ok && d < bestD {
-					best, bestD = opt, d
-				}
-			}
+		if outcome == "rejected" {
+			return "rejected", "rejected", nil
 		}
-		return best, nil
+		return "approved", "approved", nil
+	default:
+		return outcome, outcome, nil
 	}
 }
 
-// bestArm picks the event arm whose outcome leads closest to a terminal
-// (already-visited targets penalized to break loops); returns
-// (nil, maxTimeout) when only timers exist.
-func bestArm(def *core.WorkflowDefinition, st core.State, dist map[string]int, visited map[string]bool) (*core.WaitArm, time.Duration) {
-	var best *core.WaitArm
-	bestD := 1 << 30
-	var maxTimeout time.Duration
+func firstProbe(st core.State) *core.ProbeSpec {
+	for _, arm := range st.Arms {
+		if arm.Probe != nil {
+			return arm.Probe
+		}
+	}
+	return nil
+}
+
+func armFor(st core.State, outcome string) *core.WaitArm {
 	for i := range st.Arms {
-		arm := &st.Arms[i]
-		if arm.Timeout > 0 && arm.Timeout.D() > maxTimeout {
-			maxTimeout = arm.Timeout.D()
-		}
-		if arm.Event == "" {
-			continue
-		}
-		target := st.On[arm.Event]
-		if d, ok := dist[target]; ok {
-			if visited[target] {
-				d += 1000
-			}
-			if def.States[target].Step == core.StepGate {
-				d += 500 // prefer non-gate arms; see bestOutcome
-			}
-			if d < bestD {
-				best, bestD = arm, d
-			}
+		if st.Arms[i].Event != "" && st.Arms[i].Event == outcome {
+			return &st.Arms[i]
 		}
 	}
-	return best, maxTimeout
+	return nil
 }
 
-// distanceToTerminal BFSes reverse edges from terminal states. Timeout
-// edges are excluded — they are exceptional paths and counting them makes
-// stall-gates look like shortcuts, trapping the walk in wait loops.
-func distanceToTerminal(def *core.WorkflowDefinition) map[string]int {
-	rev := map[string][]string{}
-	dist := map[string]int{}
-	var frontier []string
+func maxTimeout(st core.State) time.Duration {
+	var max time.Duration
+	for _, arm := range st.Arms {
+		if arm.Timeout.D() > max {
+			max = arm.Timeout.D()
+		}
+	}
+	return max
+}
+
+func terminalStates(def *core.WorkflowDefinition) []string {
+	var out []string
 	for name, st := range def.States {
 		if st.Terminal {
-			dist[name] = 0
-			frontier = append(frontier, name)
-		}
-		for outcome, target := range st.On {
-			if outcome == "timeout" {
-				continue
-			}
-			rev[target] = append(rev[target], name)
+			out = append(out, name)
 		}
 	}
-	sort.Strings(frontier)
+	sort.Strings(out)
+	return out
+}
+
+// distanceTo BFSes reverse edges from the given states.
+func distanceTo(def *core.WorkflowDefinition, includeTimeout bool, targets ...string) map[string]int {
+	rev := map[string][]string{}
+	for name, st := range def.States {
+		for outcome, t := range st.On {
+			if !includeTimeout && outcome == "timeout" {
+				continue
+			}
+			rev[t] = append(rev[t], name)
+		}
+	}
+	dist := map[string]int{}
+	frontier := []string{}
+	for _, t := range targets {
+		dist[t] = 0
+		frontier = append(frontier, t)
+	}
 	for len(frontier) > 0 {
 		cur := frontier[0]
 		frontier = frontier[1:]
@@ -304,28 +392,4 @@ func setPath(m map[string]any, path []string, val any) {
 		m = next
 	}
 	m[path[len(path)-1]] = val
-}
-
-func printTrace(out io.Writer, st *store.Store, runID string) {
-	events, _ := st.EventsForRun(runID)
-	fmt.Fprintln(out, "trace:")
-	for _, e := range events {
-		fmt.Fprintf(out, "  %-22s %-16s %v\n", e.Kind, e.State, compact(e.Data))
-	}
-}
-
-func compact(m map[string]any) string {
-	if len(m) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(m))
-	for k, v := range m {
-		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
-	}
-	sort.Strings(parts)
-	s := strings.Join(parts, " ")
-	if len(s) > 100 {
-		s = s[:100] + "…"
-	}
-	return s
 }

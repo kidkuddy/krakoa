@@ -1,0 +1,5 @@
+command: scripts/sweep.sh
+every: 5m
+mode: spawn
+workflow: cmdflow
+spawn_on: [cmd-pending]

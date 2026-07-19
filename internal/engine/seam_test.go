@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -614,5 +615,145 @@ func TestWatcherTimerFiresProbeAgent(t *testing.T) {
 	}
 	if !found {
 		t.Error("watcher timer missing after fire")
+	}
+}
+
+func TestEmitSpawnsWatcherModeRun(t *testing.T) {
+	v := setup(t)
+	v.run.on("reviewing", ok("outcome", "noop"))
+	out := v.eng.HandleEmit("demo", EmittedEvent{
+		Event: "mr-draft-pending", Key: "dash!42!s1",
+		Payload: map[string]any{"repo": "dash", "mr_iid": "42", "head_sha": "s1"},
+	})
+	if len(out) < 7 || out[:7] != "spawned" {
+		t.Fatalf("manual emit should spawn: %q", out)
+	}
+	runs, _ := v.st.ListRuns()
+	if len(runs) != 1 || runs[0].Status != core.StatusDone {
+		t.Fatalf("runs = %+v", runs)
+	}
+	// replaying the same key is a no-op (dedupe shared with the watcher)
+	out = v.eng.HandleEmit("demo", EmittedEvent{Event: "mr-draft-pending", Key: "dash!42!s1"})
+	if out != "duplicate (already handled by watcher draft-mr-watch)" {
+		t.Fatalf("replay disposition = %q", out)
+	}
+	if runs, _ = v.st.ListRuns(); len(runs) != 1 {
+		t.Fatalf("dedupe failed on manual emit")
+	}
+}
+
+func TestWatcherDerailmentRetriesThenGates(t *testing.T) {
+	v := setup(t)
+	// every sweep attempt writes NO result.json (a derailed agent);
+	// 3 sweeps x (attempt + retry) = 6 scripted failures -> gate
+	for i := 0; i < 6; i++ {
+		v.run.on("watcher:draft-mr-watch", fakeStep{Result: nil})
+	}
+	v.eng.Recover() // arms the watcher timer at now
+	for i := 0; i < 3; i++ {
+		v.eng.Tick()
+		v.clock.Advance(10 * time.Minute)
+	}
+	if len(v.run.calls) != 6 {
+		t.Fatalf("want 6 attempts (retry once per sweep), got %d", len(v.run.calls))
+	}
+	gates, _ := v.st.OpenGates()
+	if len(gates) != 1 || gates[0].RunID != "" {
+		t.Fatalf("want one engine-level gate, got %+v", gates)
+	}
+	// the gate is answerable even with no run behind it
+	if err := v.eng.AnswerGate(gates[0].ID, "acknowledged", nil, "test"); err != nil {
+		t.Fatal(err)
+	}
+	// and a later healthy sweep resets the world
+	v.run.on("watcher:draft-mr-watch", fakeStep{Result: map[string]any{"outcome": "ok", "events": []any{}}})
+	v.eng.Tick()
+	if gates, _ = v.st.OpenGates(); len(gates) != 0 {
+		t.Fatalf("gates should stay closed after healthy sweep: %+v", gates)
+	}
+}
+
+func TestWatcherPromptIsImperativeAndIsolated(t *testing.T) {
+	v := setup(t)
+	v.run.on("watcher:draft-mr-watch", fakeStep{Result: map[string]any{"outcome": "ok", "events": []any{}}})
+	v.eng.Recover()
+	v.eng.Tick()
+	req := v.run.lastCall()
+	if !bytes.Contains([]byte(req.Instruction), []byte("Do not ask questions")) {
+		t.Errorf("watcher prompt not imperative: %.120s", req.Instruction)
+	}
+}
+
+func setupCmd(t *testing.T) *env {
+	t.Helper()
+	ws, errs := workspace.Load("testdata/cmddemo")
+	if len(errs) != 0 {
+		t.Fatalf("cmddemo invalid: %v", errs)
+	}
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	fr := newFakeRunner()
+	clk := &fakeClock{t: time.Date(2026, 7, 19, 9, 0, 0, 0, time.UTC)}
+	eng := New(st, fr, clk, map[string]*workspace.Workspace{"cmddemo": ws}, t.TempDir())
+	eng.Spawn = func(f func()) { f() }
+	out := &bytes.Buffer{}
+	eng.Channels = []contact.Channel{&contact.Console{W: out}}
+	eng.Log.SetOutput(out)
+	return &env{eng: eng, run: fr, clock: clk, st: st, out: out}
+}
+
+func TestCommandWatcherSweepsAndCommandProbeAdvances(t *testing.T) {
+	v := setupCmd(t)
+	v.eng.Recover() // arms both command watchers
+	v.eng.Tick()    // cmd-watch spawns a run; bad-watch strikes once
+
+	runs, _ := v.st.ListRuns()
+	if len(runs) != 1 {
+		t.Fatalf("command watcher should spawn 1 run, got %d", len(runs))
+	}
+	r := runs[0]
+	if r.State != "waiting" || r.Status != core.StatusWaiting {
+		t.Fatalf("run = %s/%s", r.State, r.Status)
+	}
+	// zero LLM calls so far: both watcher and (pending) probe are commands
+	if len(v.run.calls) != 0 {
+		t.Fatalf("no runner calls expected, got %d", len(v.run.calls))
+	}
+
+	// the probe command fires on its cadence and advances the run
+	v.clock.Advance(61 * time.Second)
+	v.eng.Tick()
+	if got, _ := v.st.GetRun(r.ID); got.Status != core.StatusDone {
+		t.Fatalf("after probe: %s/%s", got.State, got.Status)
+	}
+	// probe interpolated its $input.key argument and recorded $0 cost
+	evs, _ := v.st.EventsForRun(r.ID)
+	found := false
+	for _, e := range evs {
+		if e.Kind == "probe-outcome" {
+			found = true
+			if c, ok := e.Data["command"].(string); !ok || !strings.Contains(c, "check.sh K") {
+				t.Errorf("command not interpolated: %v", e.Data)
+			}
+			if e.Data["cost_usd"] != float64(0) {
+				t.Errorf("command probe cost should be 0: %v", e.Data)
+			}
+		}
+	}
+	if !found {
+		t.Error("no probe-outcome event")
+	}
+
+	// bad-watch: two more ticks -> 3 consecutive failures -> engine gate
+	v.clock.Advance(5 * time.Minute)
+	v.eng.Tick()
+	v.clock.Advance(5 * time.Minute)
+	v.eng.Tick()
+	gates, _ := v.st.OpenGates()
+	if len(gates) != 1 || !strings.Contains(gates[0].Payload, "bad-watch") {
+		t.Fatalf("expected bad-watch strike gate, got %+v", gates)
 	}
 }
