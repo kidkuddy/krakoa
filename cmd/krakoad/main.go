@@ -40,6 +40,7 @@ func main() {
 	addr := env("KRAKOA_HTTP_ADDR", "127.0.0.1:7770")
 	nifftyURL := env("KRAKOA_NIFFTY_URL", "http://127.0.0.1:7777")
 	nifftyTo := os.Getenv("KRAKOA_NIFFTY_TO") // empty = niffty channel off
+	chanURL := os.Getenv("KRAKOA_CHAN_URL")   // empty = chan channel off
 	wsPaths := os.Getenv("KRAKOA_WORKSPACES")
 	if wsPaths == "" {
 		log.Fatal("KRAKOA_WORKSPACES is required (comma-separated workspace dirs)")
@@ -92,6 +93,9 @@ func main() {
 	eng.Channels = []contact.Channel{&contact.Console{W: os.Stdout}}
 	if nifftyTo != "" {
 		eng.Channels = append(eng.Channels, contact.NewNiffty(nifftyURL, nifftyTo))
+	}
+	if chanURL != "" {
+		eng.Channels = append(eng.Channels, contact.NewChan(chanURL, os.Getenv("KRAKOA_CHAN_START")))
 	}
 
 	eng.Recover()
