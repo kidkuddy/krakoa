@@ -13,8 +13,12 @@ test:
 vet:
 	go vet ./...
 
+# /opt/homebrew/bin is on every clean macOS PATH (Slack-spawned agent
+# sessions don't source the user's shell profile) — symlink so krakoactl
+# resolves everywhere, not just in dotfile-blessed shells.
 install: build
 	cp bin/krakoad bin/krakoactl $(HOME)/.local/bin/
+	ln -sf $(HOME)/.local/bin/krakoactl /opt/homebrew/bin/krakoactl
 
 run: build
 	./bin/krakoad

@@ -49,6 +49,19 @@ func cmdDoctor() error {
 	bin, err := runner.ResolveBin()
 	check("claude binary", err == nil, bin, "install claude or set KRAKOA_CLAUDE_BIN")
 
+	// Spawned sessions (Slack agent mode) get a clean PATH with no shell
+	// profile — krakoactl must resolve there too, or tasks can't start.
+	cleanPath := "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+	found := ""
+	for _, dir := range strings.Split(cleanPath, ":") {
+		p := dir + "/krakoactl"
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			found = p
+			break
+		}
+	}
+	check("krakoactl on clean PATH", found != "", found, "make install (symlinks into /opt/homebrew/bin)")
+
 	// The daemon owns workspaces: prefer its inventory (and its declared
 	// doctor checks). KRAKOA_WORKSPACES is only a fallback for a client
 	// shell when krakoad is down.
