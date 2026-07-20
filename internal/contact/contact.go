@@ -51,7 +51,7 @@ func NewNiffty(url, to string) *Niffty {
 func (n *Niffty) Name() string { return "niffty" }
 
 func (n *Niffty) Deliver(g *core.Gate) error {
-	text := fmt.Sprintf("[krakoa gate %s] %s", g.ID, g.Payload)
+	text := fmt.Sprintf("⏸ YOUR TURN — [krakoa gate %s] %s", g.ID, g.Payload)
 	if len(g.Options) > 0 {
 		text += "\noptions: " + strings.Join(g.Options, " | ")
 	}

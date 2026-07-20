@@ -904,3 +904,23 @@ func TestThreadStampingAndPropagation(t *testing.T) {
 		t.Fatalf("summary = %+v", threads[0])
 	}
 }
+
+// The refiner's working folder follows the repo input through the
+// workspace repos: map — never a hardcoded clone.
+func TestWorkingFolderFollowsRepoInput(t *testing.T) {
+	v := setup(t)
+	v.run.on("refining", ok("outcome", "ok", "ticket", "d"))
+	v.run.on("grounding", ok("outcome", "ungrounded", "questions", []any{"q"}))
+	if _, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	var refine runner.Request
+	for _, c := range v.run.calls {
+		if c.State == "refining" {
+			refine = c
+		}
+	}
+	if refine.Spec.WorkingFolder != "/tmp/demo-app-clone" {
+		t.Fatalf("working folder = %q (want repos-mapped path)", refine.Spec.WorkingFolder)
+	}
+}

@@ -1,2 +1,4 @@
 name: demo
 description: generic seam-test fixture workspace (acme)
+repos:
+  acme/demo-app: /tmp/demo-app-clone

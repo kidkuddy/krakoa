@@ -400,6 +400,20 @@ func (e *Engine) startAgentStepLocked(def *core.WorkflowDefinition, run core.Run
 
 	ws := e.Workspaces[run.Workspace]
 	spec := ws.Agents[act.Agent]
+	// Working folders may be templates ("$input.repo") and resolve through
+	// the workspace repos: map — the refiner must follow the repo input,
+	// never a hardcoded clone.
+	if spec.WorkingFolder != "" {
+		folder := core.Interpolate(&run, spec.WorkingFolder)
+		if mapped, ok := ws.Repos[folder]; ok {
+			folder = mapped
+		}
+		if folder != spec.WorkingFolder {
+			cp := *spec
+			cp.WorkingFolder = folder
+			spec = &cp
+		}
+	}
 	skills := map[string]string{}
 	for _, sk := range spec.Skills {
 		skills[sk] = ws.Skills[sk]

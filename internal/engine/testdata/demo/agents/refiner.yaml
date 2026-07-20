@@ -1,2 +1,3 @@
 persona: fixture refiner
 skills: [refine-headless]
+working_folder: "$input.repo"

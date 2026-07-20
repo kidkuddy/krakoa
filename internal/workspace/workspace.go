@@ -21,6 +21,10 @@ type Meta struct {
 	Name        string        `yaml:"name"`
 	Description string        `yaml:"description,omitempty"`
 	Doctor      []DoctorCheck `yaml:"doctor,omitempty"`
+	// Repos maps logical repo identifiers (workflow inputs, e.g. a GitLab
+	// path) to local clone paths — agent working folders resolve through
+	// it, so one workflow serves many repos.
+	Repos map[string]string `yaml:"repos,omitempty"`
 }
 
 // DoctorCheck is a workspace-declared prerequisite probe. The engine knows
@@ -52,6 +56,7 @@ type Workspace struct {
 	GitVersion  string
 	Doctor      []DoctorCheck
 
+	Repos     map[string]string
 	Workflows map[string]*core.WorkflowDefinition
 	Agents    map[string]*core.AgentSpec
 	Watchers  map[string]*core.WatcherSpec
@@ -84,6 +89,7 @@ func Load(path string) (*Workspace, []error) {
 	ws.Description = meta.Description
 	ws.GitVersion = gitVersion(path)
 	ws.Doctor = meta.Doctor
+	ws.Repos = meta.Repos
 	for i, dc := range meta.Doctor {
 		if dc.Name == "" {
 			fail("workspace.yaml: doctor check %d: name is required", i)
