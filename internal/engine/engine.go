@@ -249,13 +249,19 @@ func (e *Engine) openGateLocked(run core.Run, act core.ActionOpenGate) {
 }
 
 func (e *Engine) deliver(g *core.Gate) {
+	delivery := map[string]string{}
 	for _, ch := range e.Channels {
 		if err := ch.Deliver(g); err != nil {
+			delivery[ch.Name()] = err.Error()
 			e.Log.Printf("deliver gate %s via %s: %v", g.ID, ch.Name(), err)
 			e.event(g.RunID, g.State, "gate-delivery-failed", map[string]any{"gate": g.ID, "channel": ch.Name(), "error": err.Error()}, g.Workspace)
 		} else {
+			delivery[ch.Name()] = "ok"
 			e.event(g.RunID, g.State, "gate-delivered", map[string]any{"gate": g.ID, "channel": ch.Name()}, g.Workspace)
 		}
+	}
+	if err := e.Store.SetGateDelivery(g.ID, delivery); err != nil {
+		e.Log.Printf("record delivery %s: %v", g.ID, err)
 	}
 }
 
@@ -398,7 +404,7 @@ func (e *Engine) executeStep(def *core.WorkflowDefinition, runID string, st *cor
 	if verr != "" && res.SessionID != "" && req.Resume == "" {
 		// resume the same session once with the validation error appended
 		e.mu.Lock()
-		e.event(runID, act.State, "schema-violation", map[string]any{"step": st.ID, "error": verr}, def.Workspace)
+		e.event(runID, act.State, "schema-violation", map[string]any{"step": st.ID, "agent": act.Agent, "error": verr}, def.Workspace)
 		e.mu.Unlock()
 		req.Resume = res.SessionID
 		req.ResumeMessage = "Your result.json was rejected: " + verr +

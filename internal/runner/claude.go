@@ -45,11 +45,18 @@ func isExec(p string) bool {
 const handoffProtocol = `
 # Krakoa handoff protocol
 
-You are one step of a durable workflow run. When your task is complete you
-MUST write a JSON file to the path in $KRAKOA_HANDOFF/result.json with at
-least: {"outcome": "<one of the outcomes your instructions define>"} plus any
-result fields your instructions ask for. The workflow cannot proceed without
-this file. Write it as your final action.
+You are one step of a durable workflow run. You MUST write a JSON file to
+$KRAKOA_HANDOFF/result.json with at least:
+{"outcome": "<one of the outcomes your instructions define>"} plus any
+result fields your instructions ask for. The workflow cannot proceed
+without this file.
+
+Write result.json THE MOMENT the outcome is known — immediately, before
+any cleanup, wrap-up, summaries, or final checks. Writing it is part of
+the work, not an afterthought: sessions have died between "done" and
+"writing the handoff", losing an hour of finished work. If later cleanup
+changes the picture, overwrite the file; a checkpointed result beats a
+perfect one that never lands.
 
 Before mutating any external system (ticket, MR, message), check first
 whether the effect already happened — a crashed attempt may have half-run.

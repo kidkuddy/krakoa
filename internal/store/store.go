@@ -129,7 +129,49 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	return s, nil
+}
+
+// migrate applies additive column migrations (the schema above is
+// CREATE IF NOT EXISTS, so existing tables never pick up new columns).
+func (s *Store) migrate() error {
+	for _, m := range []struct{ table, column, ddl string }{
+		{"gates", "delivery", `ALTER TABLE gates ADD COLUMN delivery TEXT NOT NULL DEFAULT '{}'`},
+	} {
+		has, err := s.hasColumn(m.table, m.column)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := s.db.Exec(m.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) hasColumn(table, column string) (bool, error) {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -312,18 +354,18 @@ func (s *Store) StepsForRun(runID string) ([]*core.StepExecution, error) {
 func (s *Store) CreateGate(g *core.Gate) error {
 	opts, _ := json.Marshal(g.Options)
 	_, err := s.db.Exec(`INSERT INTO gates
-		(id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at, delivery)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		g.ID, g.Workspace, g.RunID, g.State, string(g.Kind), g.Payload, string(opts),
-		string(g.Status), g.Response, jenc(g.Answers), g.Responder, ts(g.CreatedAt), ts(g.ResolvedAt))
+		string(g.Status), g.Response, jenc(g.Answers), g.Responder, ts(g.CreatedAt), ts(g.ResolvedAt), jenc(anyMap(g.Delivery)))
 	return err
 }
 
 func scanGate(row interface{ Scan(...any) error }) (*core.Gate, error) {
 	var g core.Gate
-	var kind, opts, status, answers, created, resolved string
+	var kind, opts, status, answers, created, resolved, delivery string
 	err := row.Scan(&g.ID, &g.Workspace, &g.RunID, &g.State, &kind, &g.Payload, &opts,
-		&status, &g.Response, &answers, &g.Responder, &created, &resolved)
+		&status, &g.Response, &answers, &g.Responder, &created, &resolved, &delivery)
 	if err != nil {
 		return nil, err
 	}
@@ -331,11 +373,27 @@ func scanGate(row interface{ Scan(...any) error }) (*core.Gate, error) {
 	g.Status = core.GateStatus(status)
 	json.Unmarshal([]byte(opts), &g.Options)
 	g.Answers = jdec(answers)
+	g.Delivery = map[string]string{}
+	json.Unmarshal([]byte(delivery), &g.Delivery)
 	g.CreatedAt, g.ResolvedAt = parseTS(created), parseTS(resolved)
 	return &g, nil
 }
 
-const gateCols = "id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at"
+func anyMap(m map[string]string) map[string]any {
+	out := map[string]any{}
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// SetGateDelivery records the per-channel delivery outcome.
+func (s *Store) SetGateDelivery(id string, delivery map[string]string) error {
+	_, err := s.db.Exec(`UPDATE gates SET delivery=? WHERE id=?`, jenc(anyMap(delivery)), id)
+	return err
+}
+
+const gateCols = "id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at, delivery"
 
 func (s *Store) GetGate(id string) (*core.Gate, error) {
 	return scanGate(s.db.QueryRow(`SELECT `+gateCols+` FROM gates WHERE id=?`, id))
@@ -515,7 +573,17 @@ func (s *Store) Reschedule(id int64, next time.Time) error {
 // --- buffered signals ---
 
 // BufferSignal stores an event targeting a run that can't consume it yet.
+// Idempotent per (run, event): watchers re-observe unchanged world state
+// every sweep, and one pending copy is all a wait state can consume.
 func (s *Store) BufferSignal(runID, event string, payload map[string]any, at time.Time) error {
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM signals WHERE run_id=? AND event=? AND consumed=0`,
+		runID, event).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
 	_, err := s.db.Exec(`INSERT INTO signals (run_id, event, payload, at) VALUES (?,?,?,?)`,
 		runID, event, jenc(payload), ts(at))
 	return err

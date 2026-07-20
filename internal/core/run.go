@@ -88,6 +88,10 @@ type Gate struct {
 	Responder  string
 	CreatedAt  time.Time
 	ResolvedAt time.Time
+
+	// Delivery records per-channel outcome ("ok" or the error) so an
+	// undelivered ping is visible, never a silent fallback.
+	Delivery map[string]string
 }
 
 // Event is one row of the append-only audit spine.

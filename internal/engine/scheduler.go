@@ -385,9 +385,13 @@ func readWatcherEvents(handoffDir string) ([]EmittedEvent, bool) {
 	return parsed.Events, true
 }
 
-// HandleWatcherEvents dedupes and routes a watcher sweep's observations.
-// Consumed events (advanced, buffered, spawned) are marked; dropped ones are
-// not, so they retry next sweep (e.g. correlation target not filed yet).
+// HandleWatcherEvents routes a watcher sweep's observations. watch_dedupe is
+// SPAWN protection only: a spawnable event's key is checked and marked
+// around the spawn, so one observation spawns one run. Correlation (resume)
+// events never touch dedupe — a ticket goes ready on EVERY review round, and
+// a consumed mark would swallow all but the first (found live, CAL-653);
+// their idempotence comes from run-state routing + the duplicate-buffer
+// guard.
 func (e *Engine) HandleWatcherEvents(wsName, watcherName string, events []EmittedEvent) {
 	defer e.drain()
 	e.mu.Lock()
@@ -398,13 +402,14 @@ func (e *Engine) HandleWatcherEvents(wsName, watcherName string, events []Emitte
 	}
 	w := ws.Watchers[watcherName]
 	for _, ev := range events {
-		if ev.Key != "" {
+		spawnEvent := w != nil && w.Mode == "spawn" && spawnable(w, ev.Event)
+		if spawnEvent && ev.Key != "" {
 			if seen, _ := e.Store.DedupeSeen(watcherName, ev.Key); seen {
 				continue
 			}
 		}
 		disposition := e.routeEventLocked(wsName, ev)
-		if disposition == "no matching run" && w != nil && w.Mode == "spawn" && spawnable(w, ev.Event) {
+		if disposition == "no matching run" && spawnEvent {
 			run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, "")
 			if err != nil {
 				e.Log.Printf("watcher %s spawn: %v", watcherName, err)
@@ -413,7 +418,7 @@ func (e *Engine) HandleWatcherEvents(wsName, watcherName string, events []Emitte
 			disposition = "spawned " + run.ID
 		}
 		e.event("", "watcher:"+watcherName, "watcher-observed", map[string]any{"event": ev.Event, "key": ev.Key, "disposition": disposition}, wsName)
-		if ev.Key != "" && disposition != "no matching run" && disposition != "run finished; dropped" {
+		if spawnEvent && ev.Key != "" && disposition != "no matching run" && disposition != "run finished; dropped" {
 			e.Store.DedupeMark(watcherName, ev.Key, e.Clock.Now())
 		}
 	}

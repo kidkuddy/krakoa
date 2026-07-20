@@ -6,5 +6,6 @@ bin/
 *.db-wal
 *.db-shm
 PLAN.md
+FEATURES.md
 .playwright-mcp/
 ui-*.png

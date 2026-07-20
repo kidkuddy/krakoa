@@ -200,6 +200,13 @@ func cmdGates() error {
 		if opts, ok := g["Options"].([]any); ok && len(opts) > 0 {
 			fmt.Printf("  options: %v\n", opts)
 		}
+		if del, ok := g["Delivery"].(map[string]any); ok {
+			for ch, res := range del {
+				if res != "ok" {
+					fmt.Printf("  ⚠ %s delivery FAILED — seen only here (%v)\n", ch, res)
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -224,7 +231,12 @@ func cmdEmit(args []string) error {
 	fs := flag.NewFlagSet("emit", flag.ExitOnError)
 	ws := fs.String("workspace", os.Getenv("KRAKOA_WORKSPACE"), "workspace name")
 	key := fs.String("key", "", "dedupe/correlation key")
-	run := fs.String("run", os.Getenv("KRAKOA_RUN"), "target run id")
+	// NEVER default --run from KRAKOA_RUN: agents carry that env var, so a
+	// step-internal emit would silently target its own run and strand the
+	// signal there (live run 2: the sweeper's mr-ready never reached the
+	// waiting lifecycle). Correlation-key routing is the default; targeting
+	// a specific run is an explicit operator action.
+	run := fs.String("run", "", "target run id (explicit only)")
 	payload := fs.String("payload", "", "JSON payload")
 	pos, err := parseAnywhere(fs, args)
 	if err != nil {

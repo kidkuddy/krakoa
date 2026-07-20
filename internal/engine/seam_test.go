@@ -786,3 +786,84 @@ func TestQuestionGateAnswersAccumulate(t *testing.T) {
 		t.Fatalf("answers did not accumulate: %+v", answers)
 	}
 }
+
+// Correlation events are NOT spawn-deduped: a ticket goes ready on every
+// review round, and each recurrence must route (found live: one consumed
+// dedupe mark swallowed all later mr-ready events for the ticket).
+func TestCorrelationEventsRecurAcrossReviewRounds(t *testing.T) {
+	v := setup(t)
+	fr := v.run
+	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
+	fr.on("grounding", ok("outcome", "grounded"))
+	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
+	fr.on("dispatching", ok("outcome", "ok"))
+	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sweep := []EmittedEvent{
+		{Event: "ticket-in-review", Key: "CAL-9", Payload: map[string]any{"ticket_id": "CAL-9"}},
+		{Event: "mr-ready", Key: "CAL-9", Payload: map[string]any{"ticket_id": "CAL-9"}},
+	}
+	// round 1: review found problems -> conflict -> retrigger -> building
+	fr.on("merging", ok("outcome", "conflict"))
+	fr.on("retriggering", ok("outcome", "ok"))
+	v.eng.HandleWatcherEvents("demo", "draft-mr-watch", sweep)
+	if r := v.mustRun(t, run.ID); r.State != "building" {
+		t.Fatalf("after round 1: %s/%s", r.State, r.Status)
+	}
+	// round 2: the SAME keys recur — must route again, not dedupe-swallow
+	fr.on("merging", ok("outcome", "merged", "mr_url", "u"))
+	fr.on("notifying", ok("outcome", "ok"))
+	fr.on("closing", ok("outcome", "ok"))
+	v.eng.HandleWatcherEvents("demo", "draft-mr-watch", sweep)
+	if r := v.mustRun(t, run.ID); r.Status != core.StatusDone {
+		t.Fatalf("round-2 mr-ready swallowed: %s/%s", r.State, r.Status)
+	}
+}
+
+// Re-observed world state buffers at most one pending copy per (run, event).
+func TestBufferedSignalsDeduplicate(t *testing.T) {
+	v := setup(t)
+	fr := v.run
+	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
+	fr.on("grounding", ok("outcome", "grounded"))
+	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
+	var jobs []func()
+	v.eng.Spawn = func(f func()) { jobs = append(jobs, f) }
+	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// run the pipeline up to dispatching, then hold it mid-state there
+	for len(jobs) > 3 {
+		t.Fatal("unexpected")
+	}
+	for i := 0; i < 3; i++ {
+		j := jobs[0]
+		jobs = jobs[1:]
+		j()
+	}
+	if r := v.mustRun(t, run.ID); r.State != "dispatching" || r.Status != core.StatusRunning {
+		t.Fatalf("precondition: %s/%s", r.State, r.Status)
+	}
+	// three sweeps observe the same unchanged world
+	for i := 0; i < 3; i++ {
+		v.eng.HandleWatcherEvents("demo", "draft-mr-watch", []EmittedEvent{
+			{Event: "ticket-in-review", Key: "CAL-9", Payload: map[string]any{"ticket_id": "CAL-9"}},
+		})
+	}
+	sigs, _ := v.st.PendingSignals(run.ID)
+	if len(sigs) != 1 {
+		t.Fatalf("want exactly 1 pending signal, got %d", len(sigs))
+	}
+	// finish dispatching; building consumes the single buffered signal
+	fr.on("dispatching", ok("outcome", "ok"))
+	v.eng.Spawn = func(f func()) { f() }
+	j := jobs[0]
+	j()
+	if r := v.mustRun(t, run.ID); r.State != "awaiting-ready" {
+		t.Fatalf("buffered signal not consumed: %s/%s", r.State, r.Status)
+	}
+}
