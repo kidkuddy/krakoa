@@ -126,10 +126,8 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		writeJSON(w, code, map[string]string{"error": err.Error()})
 	}
 
-	mux.HandleFunc("GET /ui", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(uiHTML))
-	})
+	mux.Handle("GET /ui", uiHandler())
+	mux.Handle("GET /ui/", uiHandler())
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		wss := map[string]string{}
@@ -215,7 +213,8 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		}
 		steps, _ := st.StepsForRun(id)
 		events, _ := st.EventsForRun(id)
-		writeJSON(w, 200, map[string]any{"run": run, "steps": steps, "events": events})
+		timers, _ := st.RunTimers(id)
+		writeJSON(w, 200, map[string]any{"run": run, "steps": steps, "events": events, "timers": timers})
 	})
 
 	mux.HandleFunc("GET /v1/gates", func(w http.ResponseWriter, r *http.Request) {

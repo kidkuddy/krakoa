@@ -9,3 +9,4 @@ PLAN.md
 FEATURES.md
 .playwright-mcp/
 ui-*.png
+ui/node_modules/

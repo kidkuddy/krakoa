@@ -592,6 +592,16 @@ func (s *Store) DueTimers(now time.Time) ([]*Timer, error) {
 	return scanTimers(rows)
 }
 
+// RunTimers returns a run's armed timers (live wait rendering).
+func (s *Store) RunTimers(runID string) ([]*Timer, error) {
+	rows, err := s.db.Query(`SELECT id, run_id, state, kind, fire_at, every_ms, payload FROM timers WHERE active=1 AND run_id=?`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTimers(rows)
+}
+
 // ActiveTimers returns all armed timers (startup re-arm).
 func (s *Store) ActiveTimers() ([]*Timer, error) {
 	rows, err := s.db.Query(`SELECT id, run_id, state, kind, fire_at, every_ms, payload FROM timers WHERE active=1`)
