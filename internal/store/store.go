@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS signals (
   consumed INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS signals_pending ON signals(run_id, consumed);
+
+-- contact bindings per effective thread key (run id until the thread
+-- template stamps, migrated to the thread key after)
+CREATE TABLE IF NOT EXISTS thread_refs (
+  thread TEXT NOT NULL,
+  kind   TEXT NOT NULL,   -- slack_ts | board_item | canvas:<gate-id>
+  value  TEXT NOT NULL,
+  PRIMARY KEY (thread, kind)
+);
 `
 
 type Store struct {
@@ -144,6 +153,7 @@ func (s *Store) migrate() error {
 	for _, m := range []struct{ table, column, ddl string }{
 		{"gates", "delivery", `ALTER TABLE gates ADD COLUMN delivery TEXT NOT NULL DEFAULT '{}'`},
 		{"runs", "thread", `ALTER TABLE runs ADD COLUMN thread TEXT NOT NULL DEFAULT ''`},
+		{"gates", "questions", `ALTER TABLE gates ADD COLUMN questions TEXT NOT NULL DEFAULT '[]'`},
 	} {
 		has, err := s.hasColumn(m.table, m.column)
 		if err != nil {
@@ -289,10 +299,31 @@ func (s *Store) ListRuns(statuses ...core.RunStatus) ([]*core.Run, error) {
 	return out, rows.Err()
 }
 
-// SetRunThread stamps a run's thread key (once resolvable).
+// SetRunThread stamps a run's thread key (once resolvable) and migrates any
+// contact refs bound under the run id to the thread key.
 func (s *Store) SetRunThread(id, thread string) error {
-	_, err := s.db.Exec(`UPDATE runs SET thread=? WHERE id=?`, thread, id)
+	if _, err := s.db.Exec(`UPDATE runs SET thread=? WHERE id=?`, thread, id); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE OR IGNORE thread_refs SET thread=? WHERE thread=?`, thread, id)
 	return err
+}
+
+// SetThreadRef stores a contact binding for an effective thread key.
+func (s *Store) SetThreadRef(thread, kind, value string) error {
+	_, err := s.db.Exec(`INSERT INTO thread_refs (thread, kind, value) VALUES (?,?,?)
+		ON CONFLICT(thread, kind) DO UPDATE SET value=excluded.value`, thread, kind, value)
+	return err
+}
+
+// ThreadRef fetches one binding ("" if absent).
+func (s *Store) ThreadRef(thread, kind string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM thread_refs WHERE thread=? AND kind=?`, thread, kind).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
 }
 
 // RunsByThread returns a thread's runs, oldest first.
@@ -420,18 +451,18 @@ func (s *Store) StepsForRun(runID string) ([]*core.StepExecution, error) {
 func (s *Store) CreateGate(g *core.Gate) error {
 	opts, _ := json.Marshal(g.Options)
 	_, err := s.db.Exec(`INSERT INTO gates
-		(id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at, delivery)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at, delivery, questions)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		g.ID, g.Workspace, g.RunID, g.State, string(g.Kind), g.Payload, string(opts),
-		string(g.Status), g.Response, jenc(g.Answers), g.Responder, ts(g.CreatedAt), ts(g.ResolvedAt), jenc(anyMap(g.Delivery)))
+		string(g.Status), g.Response, jenc(g.Answers), g.Responder, ts(g.CreatedAt), ts(g.ResolvedAt), jenc(anyMap(g.Delivery)), jencList(g.Questions))
 	return err
 }
 
 func scanGate(row interface{ Scan(...any) error }) (*core.Gate, error) {
 	var g core.Gate
-	var kind, opts, status, answers, created, resolved, delivery string
+	var kind, opts, status, answers, created, resolved, delivery, questions string
 	err := row.Scan(&g.ID, &g.Workspace, &g.RunID, &g.State, &kind, &g.Payload, &opts,
-		&status, &g.Response, &answers, &g.Responder, &created, &resolved, &delivery)
+		&status, &g.Response, &answers, &g.Responder, &created, &resolved, &delivery, &questions)
 	if err != nil {
 		return nil, err
 	}
@@ -441,8 +472,17 @@ func scanGate(row interface{ Scan(...any) error }) (*core.Gate, error) {
 	g.Answers = jdec(answers)
 	g.Delivery = map[string]string{}
 	json.Unmarshal([]byte(delivery), &g.Delivery)
+	json.Unmarshal([]byte(questions), &g.Questions)
 	g.CreatedAt, g.ResolvedAt = parseTS(created), parseTS(resolved)
 	return &g, nil
+}
+
+func jencList(xs []string) string {
+	if xs == nil {
+		xs = []string{}
+	}
+	b, _ := json.Marshal(xs)
+	return string(b)
 }
 
 func anyMap(m map[string]string) map[string]any {
@@ -459,7 +499,7 @@ func (s *Store) SetGateDelivery(id string, delivery map[string]string) error {
 	return err
 }
 
-const gateCols = "id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at, delivery"
+const gateCols = "id, workspace, run_id, state, kind, payload, options, status, response, answers, responder, created_at, resolved_at, delivery, questions"
 
 func (s *Store) GetGate(id string) (*core.Gate, error) {
 	return scanGate(s.db.QueryRow(`SELECT `+gateCols+` FROM gates WHERE id=?`, id))

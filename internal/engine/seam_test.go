@@ -924,3 +924,48 @@ func TestWorkingFolderFollowsRepoInput(t *testing.T) {
 		t.Fatalf("working folder = %q (want repos-mapped path)", refine.Spec.WorkingFolder)
 	}
 }
+
+// Round 4: question gates carry structured questions; the board projector
+// tracks thread phase; slack refs bind pre-stamp and migrate on stamp.
+func TestQuestionsBoardAndBindings(t *testing.T) {
+	v := setup(t)
+	var board [][3]string
+	v.eng.Board = func(thread, title, lane string) { board = append(board, [3]string{thread, title, lane}) }
+
+	fr := v.run
+	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
+	fr.on("grounding", ok("outcome", "ungrounded", "questions", []any{"which direction?", "pin it?"}))
+	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "wizard task"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// bind a slack thread while the run id is still the effective thread
+	if err := v.eng.Bind(run.ID, "slack_ts", "1700000.123"); err != nil {
+		t.Fatal(err)
+	}
+	g := v.openGate(t, run.ID)
+	if len(g.Questions) != 2 || g.Questions[0] != "which direction?" {
+		t.Fatalf("structured questions missing: %+v", g.Questions)
+	}
+	if len(board) == 0 || board[len(board)-1][2] != "needs-answers" {
+		t.Fatalf("board should show needs-answers, got %v", board)
+	}
+
+	// answer; proceed to filing (thread stamps) — refs must migrate
+	fr.on("refining", ok("outcome", "ok", "ticket", "d2"))
+	fr.on("grounding", ok("outcome", "grounded"))
+	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-77"))
+	fr.on("dispatching", ok("outcome", "ok"))
+	if err := v.eng.AnswerGate(g.ID, "answered", map[string]any{"which direction?": "inbound"}, "canvas"); err != nil {
+		t.Fatal(err)
+	}
+	if got := v.eng.ThreadRefForRun(run.ID, "slack_ts"); got != "1700000.123" {
+		t.Fatalf("slack_ts lost after thread stamp: %q", got)
+	}
+	if ts, _ := v.st.ThreadRef("CAL-77", "slack_ts"); ts != "1700000.123" {
+		t.Fatalf("ref not migrated to thread key: %q", ts)
+	}
+	if board[len(board)-1][2] != "in-progress" {
+		t.Fatalf("board should show in-progress while waiting, got %v", board[len(board)-1])
+	}
+}

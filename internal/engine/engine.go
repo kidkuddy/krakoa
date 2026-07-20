@@ -59,6 +59,10 @@ type Engine struct {
 	// returns its stdout. Overridable for dry-run and tests.
 	Exec func(dir, command string) ([]byte, error)
 
+	// Board, when set, projects each thread onto an external board:
+	// Upsert(threadKey, title, lane). Called outside the lock via drain.
+	Board func(thread, title, lane string)
+
 	Log *log.Logger
 }
 
@@ -173,6 +177,7 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 	}
 	if def.Concurrency > 0 && active >= def.Concurrency {
 		e.event(run.ID, "", "run-queued", map[string]any{"active": active, "limit": def.Concurrency}, wsName)
+		e.projectBoardLocked(run)
 		return run, nil // stays queued; admitted when a slot frees
 	}
 	e.admitLocked(def, run)
@@ -200,6 +205,90 @@ func (e *Engine) stampThreadLocked(def *core.WorkflowDefinition, run *core.Run) 
 		return
 	}
 	e.event(run.ID, run.State, "thread-stamped", map[string]any{"thread": key}, run.Workspace)
+}
+
+// EffectiveThread is the grouping key before AND after the thread template
+// stamps: the run id stands in until then (refs migrate on stamp).
+func EffectiveThread(r *core.Run) string {
+	if r.Thread != "" {
+		return r.Thread
+	}
+	return r.ID
+}
+
+// Bind stores a contact ref (e.g. the Slack thread_ts) for a run's thread.
+func (e *Engine) Bind(runID, kind, value string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	run, err := e.Store.GetRun(runID)
+	if err != nil {
+		return err
+	}
+	e.event(runID, "", "thread-bound", map[string]any{"kind": kind}, run.Workspace)
+	return e.Store.SetThreadRef(EffectiveThread(run), kind, value)
+}
+
+// ThreadRefForRun resolves a contact ref through the run's thread.
+func (e *Engine) ThreadRefForRun(runID, kind string) string {
+	run, err := e.Store.GetRun(runID)
+	if err != nil {
+		return ""
+	}
+	v, _ := e.Store.ThreadRef(EffectiveThread(run), kind)
+	return v
+}
+
+// projectBoardLocked recomputes a thread's lane and queues the board upsert
+// (exec happens outside the lock). Lanes: open gate > queued > active >
+// all-terminal; "done" is the human's to set, the engine stops at
+// needs-testing.
+func (e *Engine) projectBoardLocked(run *core.Run) {
+	if e.Board == nil {
+		return
+	}
+	key := EffectiveThread(run)
+	runs, err := e.Store.RunsByThread(run.Thread)
+	if err != nil || len(runs) == 0 {
+		runs = []*core.Run{run}
+	}
+	lane := "needs-testing"
+	gates, _ := e.Store.OpenGates()
+	hasGate := false
+	for _, g := range gates {
+		for _, r := range runs {
+			if g.RunID == r.ID {
+				hasGate = true
+			}
+		}
+	}
+	active, queued := false, false
+	for _, r := range runs {
+		switch r.Status {
+		case core.StatusRunning, core.StatusWaiting:
+			active = true
+		case core.StatusQueued:
+			queued = true
+		case core.StatusNeedsAttention, core.StatusGated:
+			hasGate = true
+		}
+	}
+	switch {
+	case hasGate:
+		lane = "needs-answers"
+	case active:
+		lane = "in-progress"
+	case queued:
+		lane = "queued"
+	}
+	title := key
+	if idea, ok := runs[0].Inputs["idea"].(string); ok && idea != "" {
+		if len(idea) > 50 {
+			idea = idea[:50] + "…"
+		}
+		title = key + " — " + idea
+	}
+	board := e.Board
+	e.pending = append(e.pending, func() { board(key, title, lane) })
 }
 
 func (e *Engine) admitLocked(def *core.WorkflowDefinition, run *core.Run) {
@@ -233,6 +322,7 @@ func (e *Engine) applyLocked(def *core.WorkflowDefinition, d core.Decision) {
 			e.Log.Printf("unknown action %T", a)
 		}
 	}
+	e.projectBoardLocked(&run)
 }
 
 func (e *Engine) finishLocked(def *core.WorkflowDefinition, run core.Run, act core.ActionFinish) {
@@ -264,6 +354,17 @@ func (e *Engine) openGateLocked(run core.Run, act core.ActionOpenGate) {
 		ID: newID("g"), Workspace: run.Workspace, RunID: run.ID, State: act.State,
 		Kind: act.Kind, Payload: act.Payload, Options: act.Options,
 		Status: core.GateOpen, CreatedAt: e.Clock.Now(),
+	}
+	if act.Kind == core.GateQuestion {
+		if last, ok := run.Context["last"].(map[string]any); ok {
+			if qs, ok := last["questions"].([]any); ok {
+				for _, q := range qs {
+					if qs, ok := q.(string); ok {
+						g.Questions = append(g.Questions, qs)
+					}
+				}
+			}
+		}
 	}
 	if err := e.Store.CreateGate(g); err != nil {
 		e.Log.Printf("create gate: %v", err)

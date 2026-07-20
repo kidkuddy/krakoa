@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -26,6 +27,8 @@ const usage = `usage: krakoactl <command> [args]
   threads                                            list threads (runs grouped by work served)
   gates                                              list open gates
   answer <gate-id> <response> [--answers k=v]...     answer a gate
+  bind <run-id> --slack-ts <ts>                      bind a Slack thread to a run's thread
+  harvest <gate-id>                                  answer a question gate from its canvas
   why <run-id>                                       render a run's timeline
   emit <event> --workspace <ws> [--key k] [--run id] [--payload json]
   workspace validate <path>                          load + validate a workspace dir
@@ -52,6 +55,10 @@ func main() {
 		err = cmdGates()
 	case "answer":
 		err = cmdAnswer(os.Args[2:])
+	case "bind":
+		err = cmdBind(os.Args[2:])
+	case "harvest":
+		err = cmdHarvest(os.Args[2:])
 	case "why":
 		err = cmdWhy(os.Args[2:])
 	case "emit":
@@ -392,4 +399,109 @@ func cmdWorkspace(args []string) error {
 	default:
 		return fmt.Errorf("unknown workspace subcommand %q", args[0])
 	}
+}
+
+// cmdBind stores a contact ref (e.g. Slack thread_ts) on a run's thread —
+// the agent-mode Slack session calls this right after starting a run.
+func cmdBind(args []string) error {
+	fs := flag.NewFlagSet("bind", flag.ExitOnError)
+	ts := fs.String("slack-ts", "", "Slack thread_ts to bind")
+	kind := fs.String("kind", "slack_ts", "ref kind")
+	pos, err := parseAnywhere(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 || *ts == "" {
+		return fmt.Errorf("usage: bind <run-id> --slack-ts <ts> [--kind slack_ts]")
+	}
+	return call("POST", "/v1/runs/"+pos[0]+"/bind", map[string]string{"kind": *kind, "value": *ts}, nil)
+}
+
+// cmdHarvest reads a question gate's canvas back and answers the gate from
+// its ANSWER: blocks — deterministic parsing, no LLM. The engine never
+// learns niffty; this is a client-side bridge.
+func cmdHarvest(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: harvest <gate-id>")
+	}
+	gateID := args[0]
+	var gate struct {
+		RunID     string
+		Kind      string
+		Questions []string
+	}
+	if err := call("GET", "/v1/gates/"+gateID, nil, &gate); err != nil {
+		return err
+	}
+	var ref struct{ Value string }
+	if err := call("GET", "/v1/runs/"+gate.RunID+"/refs?kind=canvas:"+gateID, nil, &ref); err != nil {
+		return err
+	}
+	if ref.Value == "" {
+		return fmt.Errorf("no canvas bound to gate %s", gateID)
+	}
+	bin := os.Getenv("KRAKOA_NIFFTY_BIN")
+	if bin == "" {
+		bin = "niffty"
+	}
+	out, err := exec.Command(bin, "canvas", "read", ref.Value).Output()
+	if err != nil {
+		return fmt.Errorf("canvas read: %w", err)
+	}
+	answers := parseAnswers(string(out), gate.Questions)
+	if len(answers) == 0 {
+		return fmt.Errorf("no filled ANSWER: blocks found in the canvas")
+	}
+	if err := call("POST", "/v1/gates/"+gateID+"/answer", map[string]any{
+		"response": "answered", "answers": answers, "responder": "canvas",
+	}, nil); err != nil {
+		return err
+	}
+	fmt.Printf("harvested %d answer(s) from the canvas -> gate %s\n", len(answers), gateID)
+	return nil
+}
+
+// parseAnswers pairs the Nth ANSWER: block with the Nth question. A block
+// runs from "ANSWER:" to the next heading or ANSWER line; empty blocks are
+// skipped (unanswered questions stay unanswered).
+func parseAnswers(md string, questions []string) map[string]any {
+	answers := map[string]any{}
+	lines := strings.Split(md, "\n")
+	idx := -1
+	var cur []string
+	flush := func() {
+		if idx < 0 {
+			return
+		}
+		text := strings.TrimSpace(strings.Join(cur, "\n"))
+		if text == "" {
+			return
+		}
+		key := fmt.Sprintf("answer_%d", idx+1)
+		if idx < len(questions) {
+			key = questions[idx]
+		}
+		answers[key] = text
+	}
+	n := 0
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if after, ok := strings.CutPrefix(trimmed, "ANSWER:"); ok {
+			flush()
+			idx = n
+			n++
+			cur = []string{strings.TrimSpace(after)}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			flush()
+			idx = -1
+			continue
+		}
+		if idx >= 0 {
+			cur = append(cur, l)
+		}
+	}
+	flush()
+	return answers
 }

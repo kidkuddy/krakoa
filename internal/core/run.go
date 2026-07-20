@@ -95,6 +95,11 @@ type Gate struct {
 	// Delivery records per-channel outcome ("ok" or the error) so an
 	// undelivered ping is visible, never a silent fallback.
 	Delivery map[string]string
+
+	// Questions holds the structured question list for question gates
+	// (extracted from the transition result), so contact surfaces can
+	// render one section per question instead of parsing payload prose.
+	Questions []string
 }
 
 // Event is one row of the append-only audit spine.

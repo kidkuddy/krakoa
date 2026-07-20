@@ -92,7 +92,23 @@ func main() {
 	eng := engine.New(st, &runner.Claude{Bin: bin}, engine.RealClock{}, workspaces, dataDir)
 	eng.Channels = []contact.Channel{&contact.Console{W: os.Stdout}}
 	if nifftyTo != "" {
-		eng.Channels = append(eng.Channels, contact.NewNiffty(nifftyURL, nifftyTo))
+		nf := contact.NewNiffty(nifftyURL, nifftyTo)
+		nf.Bin = os.Getenv("KRAKOA_NIFFTY_BIN")
+		nf.ThreadTS = func(runID string) string { return eng.ThreadRefForRun(runID, "slack_ts") }
+		nf.SaveRef = func(runID, kind, value string) { eng.Bind(runID, kind, value) }
+		eng.Channels = append(eng.Channels, nf)
+		if nf.Bin != "" {
+			board := &contact.NifftyBoard{
+				Bin: nf.Bin,
+				GetRef: func(thread, kind string) string {
+					v, _ := st.ThreadRef(thread, kind)
+					return v
+				},
+				SaveRef: func(thread, kind, value string) { st.SetThreadRef(thread, kind, value) },
+				Log:     log.Printf,
+			}
+			eng.Board = board.Upsert
+		}
 	}
 	if chanURL != "" {
 		eng.Channels = append(eng.Channels, contact.NewChan(chanURL, os.Getenv("KRAKOA_CHAN_START")))
@@ -219,6 +235,33 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		events, _ := st.EventsForRun(id)
 		timers, _ := st.RunTimers(id)
 		writeJSON(w, 200, map[string]any{"run": run, "steps": steps, "events": events, "timers": timers})
+	})
+
+	mux.HandleFunc("GET /v1/gates/{id}", func(w http.ResponseWriter, r *http.Request) {
+		g, err := st.GetGate(r.PathValue("id"))
+		if err != nil {
+			fail(w, 404, fmt.Errorf("gate not found"))
+			return
+		}
+		writeJSON(w, 200, g)
+	})
+
+	mux.HandleFunc("POST /v1/runs/{id}/bind", func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Kind, Value string }
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Kind == "" || body.Value == "" {
+			fail(w, 400, fmt.Errorf("kind and value required"))
+			return
+		}
+		if err := eng.Bind(r.PathValue("id"), body.Kind, body.Value); err != nil {
+			fail(w, 404, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("GET /v1/runs/{id}/refs", func(w http.ResponseWriter, r *http.Request) {
+		kind := r.URL.Query().Get("kind")
+		writeJSON(w, 200, map[string]string{"value": eng.ThreadRefForRun(r.PathValue("id"), kind)})
 	})
 
 	mux.HandleFunc("GET /v1/gates", func(w http.ResponseWriter, r *http.Request) {
