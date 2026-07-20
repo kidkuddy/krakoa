@@ -30,6 +30,9 @@ type Run struct {
 
 	State  string
 	Status RunStatus
+	// Thread groups runs serving the same piece of work (ticket id etc.);
+	// empty until the definition's thread template resolves.
+	Thread string
 
 	Inputs  map[string]any
 	Context map[string]any // state name -> that step's result

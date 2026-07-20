@@ -4,6 +4,7 @@ inputs:
   idea: {type: text, required: true}
   repo: {type: string, default: acme/demo-app}
 concurrency: 3
+thread: "$filing.ticket_id"
 start: refining
 states:
   refining:

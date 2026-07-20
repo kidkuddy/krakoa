@@ -165,6 +165,7 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 		return nil, err
 	}
 	e.event(run.ID, "", "run-created", map[string]any{"inputs": inputs, "def_hash": def.Hash}, wsName)
+	e.stampThreadLocked(def, run)
 
 	active, err := e.Store.CountActive(wsName, wfName)
 	if err != nil {
@@ -176,6 +177,29 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 	}
 	e.admitLocked(def, run)
 	return run, nil
+}
+
+// stampThreadLocked resolves the definition's thread template the moment it
+// becomes resolvable and stamps the run once. Runs sharing a thread key
+// serve the same piece of work (F4).
+func (e *Engine) stampThreadLocked(def *core.WorkflowDefinition, run *core.Run) {
+	if run.Thread != "" || def.Thread == "" {
+		return
+	}
+	v, err := core.Resolve(run, def.Thread)
+	if err != nil {
+		return // not resolvable yet; try again after the next transition
+	}
+	key := fmt.Sprintf("%v", v)
+	if key == "" || key == "<nil>" {
+		return
+	}
+	run.Thread = key
+	if err := e.Store.SetRunThread(run.ID, key); err != nil {
+		e.Log.Printf("stamp thread %s: %v", run.ID, err)
+		return
+	}
+	e.event(run.ID, run.State, "thread-stamped", map[string]any{"thread": key}, run.Workspace)
 }
 
 func (e *Engine) admitLocked(def *core.WorkflowDefinition, run *core.Run) {
@@ -192,6 +216,7 @@ func (e *Engine) applyLocked(def *core.WorkflowDefinition, d core.Decision) {
 		e.Log.Printf("save run %s: %v", run.ID, err)
 		return
 	}
+	e.stampThreadLocked(def, &run)
 	for _, a := range d.Actions {
 		switch act := a.(type) {
 		case core.ActionRunAgent:

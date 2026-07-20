@@ -4,7 +4,9 @@ inputs:
   repo: {type: string, required: true}
   mr_iid: {type: string, required: true}
   head_sha: {type: string, required: true}
+  ticket_id: {type: string}
 concurrency: 2
+thread: "$input.ticket_id"
 start: reviewing
 states:
   reviewing:

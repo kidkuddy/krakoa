@@ -867,3 +867,40 @@ func TestBufferedSignalsDeduplicate(t *testing.T) {
 		t.Fatalf("buffered signal not consumed: %s/%s", r.State, r.Status)
 	}
 }
+
+// Threads: the lifecycle stamps its thread once filing resolves; a watcher
+// spawn carrying the same ticket joins the same thread; aggregation sees one
+// piece of work.
+func TestThreadStampingAndPropagation(t *testing.T) {
+	v := setup(t)
+	fr := v.run
+	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
+	fr.on("grounding", ok("outcome", "grounded"))
+	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
+	fr.on("dispatching", ok("outcome", "ok"))
+	life, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := v.mustRun(t, life.ID); r.Thread != "CAL-9" {
+		t.Fatalf("lifecycle thread = %q (want CAL-9)", r.Thread)
+	}
+
+	fr.on("reviewing", ok("outcome", "noop"))
+	v.eng.HandleWatcherEvents("demo", "draft-mr-watch", []EmittedEvent{{
+		Event: "mr-draft-pending", Key: "dash!7!s1",
+		Payload: map[string]any{"repo": "dash", "mr_iid": "7", "head_sha": "s1", "ticket_id": "CAL-9"},
+	}})
+	runs, _ := v.st.RunsByThread("CAL-9")
+	if len(runs) != 2 {
+		t.Fatalf("thread CAL-9 should hold 2 runs, got %d", len(runs))
+	}
+
+	threads, err := v.st.Threads()
+	if err != nil || len(threads) != 1 {
+		t.Fatalf("threads = %+v, %v", threads, err)
+	}
+	if threads[0].Thread != "CAL-9" || threads[0].Runs != 2 || threads[0].CostUSD <= 0 {
+		t.Fatalf("summary = %+v", threads[0])
+	}
+}

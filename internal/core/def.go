@@ -109,8 +109,12 @@ type WorkflowDefinition struct {
 	Trigger     Trigger              `yaml:"trigger"`
 	Inputs      map[string]InputSpec `yaml:"inputs,omitempty"`
 	Concurrency int                  `yaml:"concurrency,omitempty"` // 0 = unlimited
-	Start       string               `yaml:"start"`
-	States      map[string]State     `yaml:"states"`
+	// Thread is a template naming the piece of work this run serves (e.g.
+	// "$filing.ticket_id" or "$input.ticket_id"). Stamped on the run as
+	// soon as it resolves; runs sharing a thread key group together.
+	Thread string           `yaml:"thread,omitempty"`
+	Start  string           `yaml:"start"`
+	States map[string]State `yaml:"states"`
 }
 
 // AgentSpec is a named agent description, referenced by workflow states.

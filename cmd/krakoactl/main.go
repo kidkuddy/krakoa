@@ -22,7 +22,8 @@ const usage = `usage: krakoactl <command> [args]
 (flags may appear before or after positional arguments)
 
   run <workflow> --workspace <ws> [--input k=v]...   start a run
-  runs [--status s1,s2]                              list runs
+  runs [--status s1,s2] [--thread key]               list runs
+  threads                                            list threads (runs grouped by work served)
   gates                                              list open gates
   answer <gate-id> <response> [--answers k=v]...     answer a gate
   why <run-id>                                       render a run's timeline
@@ -45,6 +46,8 @@ func main() {
 		err = cmdRun(os.Args[2:])
 	case "runs":
 		err = cmdRuns(os.Args[2:])
+	case "threads":
+		err = cmdThreads()
 	case "gates":
 		err = cmdGates()
 	case "answer":
@@ -166,9 +169,12 @@ func cmdRun(args []string) error {
 func cmdRuns(args []string) error {
 	fs := flag.NewFlagSet("runs", flag.ExitOnError)
 	status := fs.String("status", "", "comma-separated status filter")
+	thread := fs.String("thread", "", "filter by thread key")
 	fs.Parse(args)
 	path := "/v1/runs"
-	if *status != "" {
+	if *thread != "" {
+		path += "?thread=" + *thread
+	} else if *status != "" {
 		path += "?status=" + *status
 	}
 	var runs []map[string]any
@@ -179,9 +185,33 @@ func cmdRuns(args []string) error {
 		fmt.Println("no runs")
 		return nil
 	}
-	fmt.Printf("%-28s %-10s %-18s %-16s %s\n", "ID", "WORKSPACE", "WORKFLOW", "STATE", "STATUS")
+	fmt.Printf("%-28s %-10s %-18s %-16s %-10s %s\n", "ID", "WORKSPACE", "WORKFLOW", "STATE", "STATUS", "THREAD")
 	for _, r := range runs {
-		fmt.Printf("%-28v %-10v %-18v %-16v %v\n", r["ID"], r["Workspace"], r["Workflow"], r["State"], r["Status"])
+		fmt.Printf("%-28v %-10v %-18v %-16v %-10v %v\n", r["ID"], r["Workspace"], r["Workflow"], r["State"], r["Status"], orDash(r["Thread"]))
+	}
+	return nil
+}
+
+func cmdThreads() error {
+	var threads []map[string]any
+	if err := call("GET", "/v1/threads", nil, &threads); err != nil {
+		return err
+	}
+	if len(threads) == 0 {
+		fmt.Println("no threads (runs get a thread key once their definition's thread template resolves)")
+		return nil
+	}
+	fmt.Printf("%-14s %-5s %-30s %-9s %s\n", "THREAD", "RUNS", "STATUSES", "COST", "LAST ACTIVITY")
+	for _, t := range threads {
+		cost := ""
+		if c, ok := t["CostUSD"].(float64); ok && c > 0 {
+			cost = fmt.Sprintf("$%.2f", c)
+		}
+		last, _ := t["LastSeen"].(string)
+		if ts, err := time.Parse(time.RFC3339Nano, last); err == nil {
+			last = ts.Local().Format("01-02 15:04")
+		}
+		fmt.Printf("%-14v %-5v %-30v %-9s %s\n", t["Thread"], t["Runs"], t["Statuses"], cost, last)
 	}
 	return nil
 }

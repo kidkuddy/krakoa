@@ -27,10 +27,12 @@ CREATE TABLE IF NOT EXISTS runs (
   context     TEXT NOT NULL DEFAULT '{}',
   edge_counts TEXT NOT NULL DEFAULT '{}',
   parent      TEXT NOT NULL DEFAULT '',
+  thread      TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_status ON runs(workspace, workflow, status);
+CREATE INDEX IF NOT EXISTS runs_thread ON runs(thread);
 
 CREATE TABLE IF NOT EXISTS steps (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,6 +144,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) migrate() error {
 	for _, m := range []struct{ table, column, ddl string }{
 		{"gates", "delivery", `ALTER TABLE gates ADD COLUMN delivery TEXT NOT NULL DEFAULT '{}'`},
+		{"runs", "thread", `ALTER TABLE runs ADD COLUMN thread TEXT NOT NULL DEFAULT ''`},
 	} {
 		has, err := s.hasColumn(m.table, m.column)
 		if err != nil {
@@ -215,10 +218,10 @@ func jdec(s string) map[string]any {
 
 func (s *Store) CreateRun(r *core.Run) error {
 	_, err := s.db.Exec(`INSERT INTO runs
-		(id, workspace, workflow, def_hash, ws_version, state, status, inputs, context, edge_counts, parent, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		(id, workspace, workflow, def_hash, ws_version, state, status, inputs, context, edge_counts, parent, thread, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.Workspace, r.Workflow, r.DefHash, r.WSVersion, r.State, string(r.Status),
-		jenc(r.Inputs), jenc(r.Context), jenc(r.EdgeCounts), r.Parent, ts(r.CreatedAt), ts(r.UpdatedAt))
+		jenc(r.Inputs), jenc(r.Context), jenc(r.EdgeCounts), r.Parent, r.Thread, ts(r.CreatedAt), ts(r.UpdatedAt))
 	return err
 }
 
@@ -238,7 +241,7 @@ func scanRun(row interface{ Scan(...any) error }) (*core.Run, error) {
 	var r core.Run
 	var status, inputs, ctx, edges, created, updated string
 	err := row.Scan(&r.ID, &r.Workspace, &r.Workflow, &r.DefHash, &r.WSVersion,
-		&r.State, &status, &inputs, &ctx, &edges, &r.Parent, &created, &updated)
+		&r.State, &status, &inputs, &ctx, &edges, &r.Parent, &r.Thread, &created, &updated)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +254,7 @@ func scanRun(row interface{ Scan(...any) error }) (*core.Run, error) {
 	return &r, nil
 }
 
-const runCols = "id, workspace, workflow, def_hash, ws_version, state, status, inputs, context, edge_counts, parent, created_at, updated_at"
+const runCols = "id, workspace, workflow, def_hash, ws_version, state, status, inputs, context, edge_counts, parent, thread, created_at, updated_at"
 
 func (s *Store) GetRun(id string) (*core.Run, error) {
 	return scanRun(s.db.QueryRow(`SELECT `+runCols+` FROM runs WHERE id=?`, id))
@@ -280,6 +283,67 @@ func (s *Store) ListRuns(statuses ...core.RunStatus) ([]*core.Run, error) {
 			return nil, err
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SetRunThread stamps a run's thread key (once resolvable).
+func (s *Store) SetRunThread(id, thread string) error {
+	_, err := s.db.Exec(`UPDATE runs SET thread=? WHERE id=?`, thread, id)
+	return err
+}
+
+// RunsByThread returns a thread's runs, oldest first.
+func (s *Store) RunsByThread(thread string) ([]*core.Run, error) {
+	rows, err := s.db.Query(`SELECT `+runCols+` FROM runs WHERE thread=? ORDER BY created_at ASC`, thread)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*core.Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ThreadSummary is one line of `krakoactl threads`.
+type ThreadSummary struct {
+	Thread    string
+	Runs      int
+	Statuses  string // distinct statuses, comma-joined
+	CostUSD   float64
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
+// Threads aggregates runs by thread key, most recently active first.
+func (s *Store) Threads() ([]*ThreadSummary, error) {
+	rows, err := s.db.Query(`
+		SELECT r.thread, COUNT(DISTINCT r.id),
+		       GROUP_CONCAT(DISTINCT r.status),
+		       IFNULL((SELECT SUM(s2.cost_usd) FROM steps s2 WHERE s2.run_id IN
+		               (SELECT id FROM runs r2 WHERE r2.thread = r.thread)), 0),
+		       MIN(r.created_at), MAX(r.updated_at)
+		FROM runs r WHERE r.thread != ''
+		GROUP BY r.thread ORDER BY MAX(r.updated_at) DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*ThreadSummary
+	for rows.Next() {
+		var t ThreadSummary
+		var first, last string
+		if err := rows.Scan(&t.Thread, &t.Runs, &t.Statuses, &t.CostUSD, &first, &last); err != nil {
+			return nil, err
+		}
+		t.FirstSeen, t.LastSeen = parseTS(first), parseTS(last)
+		out = append(out, &t)
 	}
 	return out, rows.Err()
 }

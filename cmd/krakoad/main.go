@@ -174,6 +174,15 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 	})
 
 	mux.HandleFunc("GET /v1/runs", func(w http.ResponseWriter, r *http.Request) {
+		if thread := r.URL.Query().Get("thread"); thread != "" {
+			runs, err := st.RunsByThread(thread)
+			if err != nil {
+				fail(w, 500, err)
+				return
+			}
+			writeJSON(w, 200, runs)
+			return
+		}
 		var statuses []core.RunStatus
 		if s := r.URL.Query().Get("status"); s != "" {
 			for _, part := range strings.Split(s, ",") {
@@ -186,6 +195,15 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 			return
 		}
 		writeJSON(w, 200, runs)
+	})
+
+	mux.HandleFunc("GET /v1/threads", func(w http.ResponseWriter, r *http.Request) {
+		threads, err := st.Threads()
+		if err != nil {
+			fail(w, 500, err)
+			return
+		}
+		writeJSON(w, 200, threads)
 	})
 
 	mux.HandleFunc("GET /v1/runs/{id}", func(w http.ResponseWriter, r *http.Request) {
