@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"testing"
 	"time"
 
@@ -217,5 +218,50 @@ func TestEventsAndSteps(t *testing.T) {
 	evs, err := s.EventsForRun("r1")
 	if err != nil || len(evs) != 1 || evs[0].Kind != "transition" {
 		t.Fatalf("events = %+v, %v", evs, err)
+	}
+}
+
+// Opening a database created by an older binary must migrate it — new
+// columns arrive via ALTER, and their indexes must not fire before that.
+func TestOpenMigratesOldDatabase(t *testing.T) {
+	path := t.TempDir() + "/old.db"
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// pre-thread, pre-delivery table shapes
+	if _, err := old.Exec(`CREATE TABLE runs (
+		id TEXT PRIMARY KEY, workspace TEXT NOT NULL, workflow TEXT NOT NULL,
+		def_hash TEXT NOT NULL, ws_version TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL, status TEXT NOT NULL,
+		inputs TEXT NOT NULL DEFAULT '{}', context TEXT NOT NULL DEFAULT '{}',
+		edge_counts TEXT NOT NULL DEFAULT '{}', parent TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+		CREATE TABLE gates (
+		id TEXT PRIMARY KEY, workspace TEXT NOT NULL, run_id TEXT NOT NULL,
+		state TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '',
+		options TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL,
+		response TEXT NOT NULL DEFAULT '', answers TEXT NOT NULL DEFAULT '{}',
+		responder TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+		resolved_at TEXT NOT NULL DEFAULT '');
+		INSERT INTO runs VALUES ('r-old','ws','wf','h','','s1','done','{}','{}','{}','', '2026-07-19T00:00:00Z','2026-07-19T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on old db: %v", err)
+	}
+	defer s.Close()
+	r, err := s.GetRun("r-old")
+	if err != nil || r.Thread != "" {
+		t.Fatalf("old run after migration: %+v, %v", r, err)
+	}
+	if err := s.SetRunThread("r-old", "CAL-1"); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ = s.GetRun("r-old"); r.Thread != "CAL-1" {
+		t.Fatalf("thread not persisted: %+v", r)
 	}
 }

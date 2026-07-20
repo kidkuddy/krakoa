@@ -32,7 +32,6 @@ CREATE TABLE IF NOT EXISTS runs (
   updated_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_status ON runs(workspace, workflow, status);
-CREATE INDEX IF NOT EXISTS runs_thread ON runs(thread);
 
 CREATE TABLE IF NOT EXISTS steps (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,7 +155,10 @@ func (s *Store) migrate() error {
 			}
 		}
 	}
-	return nil
+	// Indexes on migrated columns must be created AFTER the ALTERs — in the
+	// base schema they would fail against a pre-migration table.
+	_, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS runs_thread ON runs(thread)`)
+	return err
 }
 
 func (s *Store) hasColumn(table, column string) (bool, error) {
