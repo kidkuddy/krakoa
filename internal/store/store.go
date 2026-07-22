@@ -493,6 +493,13 @@ func anyMap(m map[string]string) map[string]any {
 	return out
 }
 
+// SetGatePayload rewrites an open gate's text in place — one standing gate
+// that stays current beats a stream of new gate ids saying the same thing.
+func (s *Store) SetGatePayload(id, payload string) error {
+	_, err := s.db.Exec(`UPDATE gates SET payload=? WHERE id=? AND status='open'`, payload, id)
+	return err
+}
+
 // SetGateDelivery records the per-channel delivery outcome.
 func (s *Store) SetGateDelivery(id string, delivery map[string]string) error {
 	_, err := s.db.Exec(`UPDATE gates SET delivery=? WHERE id=?`, jenc(anyMap(delivery)), id)

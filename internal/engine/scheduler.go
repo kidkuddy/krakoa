@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,176 @@ func (e *Engine) Tick() {
 			e.mu.Unlock()
 		}
 	}
+	e.sweepStalledSignals()
+}
+
+// StallGuardAfter is how long a buffered signal may sit unusable before the
+// guard asks a human.
+const StallGuardAfter = 30 * time.Minute
+
+const stallSweepEvery = 5 * time.Minute
+
+// stallStatePrefix marks a gate raised for a stuck buffered signal; the event
+// name follows it.
+const stallStatePrefix = "signal-stall:"
+
+// StallOptions are the choices on a stalled-signal gate.
+var StallOptions = []string{"advance", "discard"}
+
+// sweepStalledSignals raises one gate per run holding a buffered signal that
+// no state reachable from where it stands can ever consume. Buffered signals
+// are only re-checked against the arms of the state a run enters NEXT, so one
+// buffered in a state the machine has already left is invisible forever —
+// three lifecycles stalled that way on mr-ready, and this kills the class.
+func (e *Engine) sweepStalledSignals() {
+	defer e.drain()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := e.Clock.Now()
+	if now.Sub(e.lastStallSweep) < stallSweepEvery {
+		return
+	}
+	e.lastStallSweep = now
+
+	runs, err := e.Store.ListRuns(core.StatusWaiting, core.StatusGated)
+	if err != nil {
+		return
+	}
+	for _, run := range runs {
+		// one open question per run at a time — this also dedupes our own gate
+		if g, _ := e.Store.OpenGateForRun(run.ID); g != nil {
+			continue
+		}
+		_, def, err := e.def(run.Workspace, run.Workflow)
+		if err != nil {
+			continue
+		}
+		sigs, _ := e.Store.PendingSignals(run.ID)
+		for _, sig := range sigs {
+			// The state the run stands in arms this event right now, yet the
+			// signal is still buffered: it arrived before the state was
+			// entered, or a workflow edit added the arm afterwards. Arming is
+			// the only other place buffered signals drain, and an armed wait
+			// never re-arms — so without this they sit forever.
+			if run.Status == core.StatusWaiting && armsEvent(def.States[run.State], sig.Event) {
+				e.Store.ConsumeSignal(sig.ID)
+				e.Store.DisarmRunTimers(run.ID)
+				e.event(run.ID, run.State, "signal-consumed", map[string]any{"event": sig.Event, "via": "stall-sweep"}, run.Workspace)
+				d := core.Advance(def, *run, sig.Event, sig.Payload)
+				e.applyLocked(def, d)
+				break // the run moved; its remaining signals settle on the next sweep
+			}
+			if now.Sub(sig.At) < StallGuardAfter || consumableFrom(def, run.State, sig.Event) {
+				continue
+			}
+			e.openGateLocked(*run, core.ActionOpenGate{
+				State: stallStatePrefix + sig.Event,
+				Kind:  core.GateChoice,
+				Payload: fmt.Sprintf("%s has held a %q signal since %s and no state reachable from %q can consume it — the run cannot move on its own. advance = jump to the state that handles it and continue there; discard = drop the signal and keep waiting.",
+					run.ID, sig.Event, sig.At.Format("Mon 15:04"), run.State),
+				Options: StallOptions,
+			})
+			break
+		}
+	}
+}
+
+// armsEvent reports whether this state waits on that event.
+func armsEvent(st core.State, event string) bool {
+	if _, ok := st.On[event]; !ok {
+		return false
+	}
+	for _, arm := range st.Arms {
+		if arm.Event == event {
+			return true
+		}
+	}
+	return false
+}
+
+// consumableFrom reports whether any state reachable from `from` (itself
+// included) arms this event.
+func consumableFrom(def *core.WorkflowDefinition, from, event string) bool {
+	seen := map[string]bool{from: true}
+	for queue := []string{from}; len(queue) > 0; queue = queue[1:] {
+		st, ok := def.States[queue[0]]
+		if !ok {
+			continue
+		}
+		for _, arm := range st.Arms {
+			if arm.Event == event {
+				return true
+			}
+		}
+		for _, next := range st.On {
+			if !seen[next] {
+				seen[next] = true
+				queue = append(queue, next)
+			}
+		}
+	}
+	return false
+}
+
+// stateArming names the state that handles this event, deterministically.
+func stateArming(def *core.WorkflowDefinition, event string) string {
+	names := make([]string, 0, len(def.States))
+	for n := range def.States {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		st := def.States[n]
+		if _, ok := st.On[event]; !ok {
+			continue
+		}
+		for _, arm := range st.Arms {
+			if arm.Event == event {
+				return n
+			}
+		}
+	}
+	return ""
+}
+
+// resolveStallLocked acts on a stalled-signal gate: discard drops the signal;
+// advance moves the run to the state that arms the event and delivers it
+// there — the thing you were doing by hand.
+func (e *Engine) resolveStallLocked(g *core.Gate, event, response string) {
+	run, err := e.Store.GetRun(g.RunID)
+	if err != nil {
+		return
+	}
+	sigs, _ := e.Store.PendingSignals(run.ID)
+	var target *store.Signal
+	for _, s := range sigs {
+		if s.Event == event {
+			target = s
+			break
+		}
+	}
+	if target == nil {
+		return // drained on its own while the gate was open
+	}
+	e.Store.ConsumeSignal(target.ID)
+	if response != "advance" {
+		e.event(run.ID, run.State, "signal-discarded", map[string]any{"event": event}, run.Workspace)
+		return
+	}
+	_, def, err := e.def(run.Workspace, run.Workflow)
+	if err != nil {
+		return
+	}
+	state := stateArming(def, event)
+	if state == "" {
+		e.parkLocked(*run, fmt.Sprintf("no state of %s arms %q", def.Name, event))
+		return
+	}
+	e.Store.DisarmRunTimers(run.ID)
+	e.event(run.ID, run.State, "signal-advanced", map[string]any{"event": event, "via": state}, run.Workspace)
+	run.State = state
+	d := core.Advance(def, *run, event, target.Payload)
+	e.applyLocked(def, d)
 }
 
 func (e *Engine) fireTimeout(t *store.Timer) {
@@ -244,7 +415,7 @@ func (e *Engine) fireWatcher(t *store.Timer) {
 // session, structurally $0. Non-zero exit or schema-invalid stdout is an
 // unambiguous failure — same retry-once + strike-gate semantics as agents.
 func (e *Engine) runCommandSweep(wsName, name, wsPath, command string) {
-	attempt := func() ([]EmittedEvent, bool) {
+	attempt := func() ([]EmittedEvent, bool, string) {
 		start := time.Now()
 		out, err := e.Exec(wsPath, command)
 		durMS := time.Since(start).Milliseconds()
@@ -264,18 +435,18 @@ func (e *Engine) runCommandSweep(wsName, name, wsPath, command string) {
 			}
 			e.event("", "watcher:"+name, "watcher-failed", map[string]any{
 				"error": detail, "command": command, "duration_ms": durMS}, wsName)
-			return nil, false
+			return nil, false, detail
 		}
 		e.event("", "watcher:"+name, "watcher-swept", map[string]any{
 			"observations": len(parsed.Events), "command": command, "duration_ms": durMS, "cost_usd": 0}, wsName)
-		return parsed.Events, true
+		return parsed.Events, true, ""
 	}
 
-	events, ok := attempt()
+	events, ok, lastErr := attempt()
 	if !ok {
-		events, ok = attempt()
+		events, ok, lastErr = attempt()
 	}
-	e.settleSweep(wsName, name, events, ok, 0)
+	e.settleSweep(wsName, name, events, ok, 0, lastErr)
 }
 
 // runWatcherSweep executes one sweep with failure semantics: no schema-valid
@@ -283,64 +454,207 @@ func (e *Engine) runCommandSweep(wsName, name, wsPath, command string) {
 // One immediate retry; WatcherFailLimit consecutive failures raise a gate.
 func (e *Engine) runWatcherSweep(wsName, name string, req runner.Request) {
 	var cost float64
-	attempt := func(r runner.Request) ([]EmittedEvent, bool) {
+	attempt := func(r runner.Request) ([]EmittedEvent, bool, string) {
 		res, err := e.Runner.Run(context.Background(), r)
 		if err != nil {
 			e.mu.Lock()
 			e.event("", "watcher:"+name, "watcher-failed", map[string]any{"error": err.Error()}, wsName)
 			e.mu.Unlock()
-			return nil, false
+			return nil, false, err.Error()
 		}
 		cost += res.CostUSD
 		events, ok := readWatcherEvents(r.HandoffDir)
 		if !ok {
+			const detail = "no schema-valid result.json (agent derailed?)"
 			e.mu.Lock()
 			e.event("", "watcher:"+name, "watcher-failed", map[string]any{
-				"error": "no schema-valid result.json (agent derailed?)", "session": res.SessionID, "cost_usd": res.CostUSD}, wsName)
+				"error": detail, "session": res.SessionID, "cost_usd": res.CostUSD}, wsName)
 			e.mu.Unlock()
-			return nil, false
+			return nil, false, detail
 		}
 		e.mu.Lock()
 		e.event("", "watcher:"+name, "watcher-swept", map[string]any{
 			"observations": len(events), "session": res.SessionID, "cost_usd": res.CostUSD}, wsName)
 		e.mu.Unlock()
-		return events, true
+		return events, true, ""
 	}
 
-	events, ok := attempt(req)
+	events, ok, lastErr := attempt(req)
 	if !ok {
 		retry := req
 		retry.BaseDir = req.BaseDir + "-retry"
 		retry.HandoffDir = filepath.Join(retry.BaseDir, "handoff")
-		events, ok = attempt(retry)
+		events, ok, lastErr = attempt(retry)
 	}
-	e.settleSweep(wsName, name, events, ok, cost)
+	e.settleSweep(wsName, name, events, ok, cost, lastErr)
+}
+
+// watcherState is one watcher's failure streak: how many, since when, and
+// what the last failure actually said.
+type watcherState struct {
+	fails   int
+	since   time.Time
+	lastErr string
 }
 
 // settleSweep applies the shared post-sweep semantics: success routes the
-// observations and resets the strike count; failure counts a strike and
-// raises an engine-level gate at the limit.
-func (e *Engine) settleSweep(wsName, name string, events []EmittedEvent, ok bool, cost float64) {
+// observations and clears the streak; failure counts a strike, backs the
+// cadence off, and keeps ONE gate up to date.
+func (e *Engine) settleSweep(wsName, name string, events []EmittedEvent, ok bool, cost float64, lastErr string) {
 	e.mu.Lock()
 	key := wsName + "/" + name
 	if ok {
-		e.watcherFails[key] = 0
+		delete(e.watcherHealth, key)
+		e.closeWatcherGatesLocked(wsName, watcherStatePrefix+name)
 		e.mu.Unlock()
 		e.HandleWatcherEvents(wsName, name, events)
 		return
 	}
-	e.watcherFails[key]++
-	fails := e.watcherFails[key]
-	if fails >= WatcherFailLimit {
-		e.watcherFails[key] = 0
-		e.openGateLocked(core.Run{ID: "", Workspace: wsName, State: "watcher:" + name}, core.ActionOpenGate{
-			State: "watcher:" + name, Kind: core.GateChoice,
-			Payload: fmt.Sprintf("watcher %s failed %d consecutive sweeps — investigate via the watcher-failed events (sweep cost so far $%.4f)", name, fails, cost),
-			Options: []string{"acknowledged"},
-		})
+	st := e.watcherHealth[key]
+	if st == nil {
+		st = &watcherState{since: e.Clock.Now()}
+		e.watcherHealth[key] = st
+	}
+	st.fails++
+	st.lastErr = lastErr
+	// A broken watcher must not keep sweeping at its healthy cadence: 60s of
+	// re-failing an expired token is what produced a gate every ~3 minutes,
+	// all night.
+	e.rescheduleWatcherLocked(wsName, name, watcherBackoff(st.fails))
+	if st.fails >= WatcherFailLimit {
+		e.raiseWatcherGateLocked(wsName, name, st, cost)
 	}
 	e.mu.Unlock()
 	e.drain()
+}
+
+// watcherBackoff is the failing cadence: 60s → 2m → 5m → 15m → 30m cap.
+// The healthy cadence returns on the first success (fireWatcher reschedules
+// on the spec's `every` before each sweep).
+func watcherBackoff(fails int) time.Duration {
+	steps := []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute}
+	if fails >= len(steps) {
+		return steps[len(steps)-1]
+	}
+	if fails < 1 {
+		return steps[0]
+	}
+	return steps[fails-1]
+}
+
+// raiseWatcherGateLocked keeps exactly one open gate per (workspace, watcher)
+// and updates its payload in place. The old code minted a fresh gate id every
+// WatcherFailLimit failures and reset the counter — 78% of all gate volume.
+func (e *Engine) raiseWatcherGateLocked(wsName, name string, st *watcherState, cost float64) {
+	state := watcherStatePrefix + name
+	payload := watcherGatePayload(name, st, cost)
+	if g := e.openWatcherGateLocked(wsName, state); g != nil {
+		if err := e.Store.SetGatePayload(g.ID, payload); err != nil {
+			e.Log.Printf("update watcher gate %s: %v", g.ID, err)
+		}
+		e.event("", state, "watcher-gate-updated", map[string]any{"gate": g.ID, "fails": st.fails}, wsName)
+		return
+	}
+	e.openGateLocked(core.Run{ID: "", Workspace: wsName, State: state}, core.ActionOpenGate{
+		State: state, Kind: core.GateChoice, Payload: payload, Options: WatcherGateOptions,
+	})
+}
+
+// openWatcherGateLocked returns the watcher's standing gate (the oldest) and
+// closes any duplicates — including the pile the old mint-a-new-one behaviour
+// left behind.
+func (e *Engine) openWatcherGateLocked(wsName, state string) *core.Gate {
+	var keep *core.Gate
+	for _, g := range e.watcherGatesLocked(wsName, state) {
+		if keep == nil {
+			keep = g
+			continue
+		}
+		e.Store.CancelGate(g.ID, e.Clock.Now())
+	}
+	return keep
+}
+
+// closeWatcherGatesLocked retires a watcher's gates once it sweeps clean —
+// the question they ask has answered itself.
+func (e *Engine) closeWatcherGatesLocked(wsName, state string) {
+	for _, g := range e.watcherGatesLocked(wsName, state) {
+		e.Store.CancelGate(g.ID, e.Clock.Now())
+		e.event("", state, "watcher-gate-closed", map[string]any{"gate": g.ID, "reason": "watcher recovered"}, wsName)
+	}
+}
+
+// watcherGatesLocked lists a watcher's open gates, oldest first.
+func (e *Engine) watcherGatesLocked(wsName, state string) []*core.Gate {
+	gates, err := e.Store.OpenGates() // ordered by created_at ASC
+	if err != nil {
+		return nil
+	}
+	var out []*core.Gate
+	for _, g := range gates {
+		if g.RunID == "" && g.Workspace == wsName && g.State == state {
+			out = append(out, g)
+		}
+	}
+	return out
+}
+
+func watcherGatePayload(name string, st *watcherState, cost float64) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "watcher %s has failed %d consecutive sweeps since %s — nothing it drives has advanced since then.",
+		name, st.fails, st.since.Format("Mon 15:04"))
+	if st.lastErr != "" {
+		fmt.Fprintf(&b, " last error: %s", st.lastErr)
+	}
+	// command watchers are exec'd directly: cost is structurally 0, and a
+	// "$0.0000" line on every gate reads as a broken cost meter.
+	if cost > 0 {
+		fmt.Fprintf(&b, " sweep cost $%.4f.", cost)
+	}
+	b.WriteString(" retry = sweep again now; pause-24h = silence it for a day; disable = stop it until you retry this gate.")
+	return b.String()
+}
+
+// applyWatcherChoiceLocked makes the options act — answering a watcher gate
+// used to be a literal no-op (answerGateLocked returned early on run-less
+// gates).
+func (e *Engine) applyWatcherChoiceLocked(g *core.Gate, response string) {
+	name := strings.TrimPrefix(g.State, watcherStatePrefix)
+	delete(e.watcherHealth, g.Workspace+"/"+name)
+	var in time.Duration
+	switch response {
+	case "pause-24h":
+		in = 24 * time.Hour
+	case "disable":
+		in = watcherDisabledFor
+	default: // retry
+		in = 0
+	}
+	e.rescheduleWatcherLocked(g.Workspace, name, in)
+	e.event("", g.State, "watcher-"+response, map[string]any{"next_sweep_in": in.String()}, g.Workspace)
+}
+
+// rescheduleWatcherLocked moves a watcher's next sweep. Pausing is a far-out
+// fire_at rather than a disarm: the timer row stays active, so armWatchers
+// won't resurrect it on the next daemon restart.
+func (e *Engine) rescheduleWatcherLocked(wsName, name string, in time.Duration) {
+	timers, err := e.Store.ActiveTimers()
+	if err != nil {
+		return
+	}
+	for _, t := range timers {
+		if t.Kind != "watcher" {
+			continue
+		}
+		if n, _ := t.Payload["watcher"].(string); n != name {
+			continue
+		}
+		if w, _ := t.Payload["workspace"].(string); w != wsName {
+			continue
+		}
+		e.Store.Reschedule(t.ID, e.Clock.Now().Add(in))
+		return
+	}
 }
 
 func snippet(b []byte) string {
@@ -353,6 +667,16 @@ func snippet(b []byte) string {
 
 // WatcherFailLimit is how many consecutive derailed sweeps raise a gate.
 const WatcherFailLimit = 3
+
+// watcherStatePrefix marks engine-level gates that belong to a watcher.
+const watcherStatePrefix = "watcher:"
+
+// watcherDisabledFor parks a disabled watcher's timer past any plausible
+// uptime — "off" without a schema column. Answering the gate `retry` re-arms.
+const watcherDisabledFor = 100 * 365 * 24 * time.Hour
+
+// WatcherGateOptions are the choices on a broken-watcher gate. They act.
+var WatcherGateOptions = []string{"retry", "pause-24h", "disable"}
 
 const watcherPreamble = `Execute ONE sweep now, exactly as your skill
 prescribes. Do not ask questions — there is no interlocutor and nobody will
@@ -410,7 +734,7 @@ func (e *Engine) HandleWatcherEvents(wsName, watcherName string, events []Emitte
 		}
 		disposition := e.routeEventLocked(wsName, ev)
 		if disposition == "no matching run" && spawnEvent {
-			run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, "")
+			run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+watcherName)
 			if err != nil {
 				e.Log.Printf("watcher %s spawn: %v", watcherName, err)
 				continue

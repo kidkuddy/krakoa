@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,10 +52,14 @@ type Engine struct {
 	// e.mu is held.
 	pending []func()
 
-	// watcherFails counts consecutive derailed sweeps per "ws/watcher";
-	// in-memory by design (a restart resets the strike count, the cadence
-	// keeps sweeping).
-	watcherFails map[string]int
+	// watcherHealth tracks the consecutive-failure streak per "ws/watcher"
+	// with enough context to keep ONE gate updated instead of minting a new
+	// one every 3 failures. In-memory by design (a restart resets the strike
+	// count, the cadence keeps sweeping).
+	watcherHealth map[string]*watcherState
+
+	// lastStallSweep throttles the buffered-signal stall guard.
+	lastStallSweep time.Time
 
 	// Exec runs a deterministic command probe (cwd = workspace dir) and
 	// returns its stdout. Overridable for dry-run and tests.
@@ -66,12 +72,21 @@ type Engine struct {
 	Log *log.Logger
 }
 
+// realExec runs a probe/sweep command. stderr rides in the error: a bare
+// "exit status 1" is undiagnosable, and 98 blind probe failures were exactly
+// that.
 func realExec(dir, command string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = dir
-	return cmd.Output()
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	out, err := cmd.Output()
+	if err != nil && errBuf.Len() > 0 {
+		err = fmt.Errorf("%w: %s", err, snippet(errBuf.Bytes()))
+	}
+	return out, err
 }
 
 // drain dispatches queued jobs without holding the lock. Every public entry
@@ -92,15 +107,15 @@ func (e *Engine) drain() {
 
 func New(st *store.Store, rn runner.Runner, clk Clock, wss map[string]*workspace.Workspace, dataDir string) *Engine {
 	return &Engine{
-		Store:        st,
-		Runner:       rn,
-		Clock:        clk,
-		Workspaces:   wss,
-		DataDir:      dataDir,
-		Spawn:        func(f func()) { go f() },
-		watcherFails: map[string]int{},
-		Exec:         realExec,
-		Log:          log.New(os.Stdout, "", log.LstdFlags),
+		Store:         st,
+		Runner:        rn,
+		Clock:         clk,
+		Workspaces:    wss,
+		DataDir:       dataDir,
+		Spawn:         func(f func()) { go f() },
+		watcherHealth: map[string]*watcherState{},
+		Exec:          realExec,
+		Log:           log.New(os.Stdout, "", log.LstdFlags),
 	}
 }
 
@@ -431,8 +446,16 @@ func (e *Engine) answerGateLocked(gateID, response string, answers map[string]an
 	}
 	e.event(g.RunID, g.State, "gate-answered", map[string]any{"gate": gateID, "response": response, "responder": responder}, g.Workspace)
 
+	if strings.HasPrefix(g.State, watcherStatePrefix) {
+		e.applyWatcherChoiceLocked(g, response)
+		return nil
+	}
+	if strings.HasPrefix(g.State, stallStatePrefix) {
+		e.resolveStallLocked(g, strings.TrimPrefix(g.State, stallStatePrefix), response)
+		return nil
+	}
 	if g.RunID == "" {
-		return nil // engine-level gate (e.g. watcher failures): ack is enough
+		return nil // engine-level gate with nothing to advance
 	}
 	run, err := e.Store.GetRun(g.RunID)
 	if err != nil {
@@ -710,7 +733,7 @@ func (e *Engine) spawnFromEventLocked(wsName string, ev EmittedEvent) string {
 				return "duplicate (already handled by watcher " + n + ")"
 			}
 		}
-		run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, "")
+		run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+n)
 		if err != nil {
 			return "spawn failed: " + err.Error()
 		}
