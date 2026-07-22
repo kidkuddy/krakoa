@@ -52,6 +52,14 @@ func (e *Engine) sweepDeliveries() {
 			e.gateNags[g.ID] = n
 		}
 		switch {
+		case g.RunID == "":
+			// Engine-level (watcher) gates are informational: never redelivered,
+			// never nagged. They live in the UI's infra strip and in
+			// `krakoactl gates`, which is exactly where noise belongs.
+		case now.Sub(g.CreatedAt) > gateEscalateAfter && n.tries == 0 && undelivered(g):
+			// Older than the escalation window and never retried in this
+			// process: a day-late ping helps nobody, the escalation below does.
+			n.tries = 1
 		case undelivered(g):
 			// Backoff on retries so a niffty outage doesn't become its own
 			// flood: 10m, 20m, 40m… capped by the sweep cadence.
