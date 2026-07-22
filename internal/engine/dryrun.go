@@ -88,20 +88,25 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 	if tgt != nil {
 		distTgt = distanceTo(def, true, tgt.state)
 	}
+	visited := map[string]bool{}
 	choose := func(state string, on map[string]string) string {
+		// agent states transition too fast for the walk loop to observe, so
+		// the chooser is the only place that sees every state we pass through
+		visited[state] = true
 		if tgt != nil && !tgt.taken && state == tgt.state {
 			tgt.taken = true
 			return tgt.outcome
 		}
 		if tgt != nil && !tgt.taken {
-			return bestByDist(def, on, distTgt, false)
+			return bestByDist(def, on, distTgt, false, visited)
 		}
-		return bestByDist(def, on, distEnd, true)
+		return bestByDist(def, on, distEnd, true, visited)
 	}
 	record := func(state, outcome string) { covered[state+"/"+outcome] = true }
 
 	clk := &settableClock{t: time.Now()}
-	rn := &synthRunner{def: def, choose: choose, record: record, fields: referencedFields(def)}
+	fields := referencedFields(def)
+	rn := &synthRunner{def: def, choose: choose, record: record, fields: fields}
 	eng := New(st, rn, clk, map[string]*workspace.Workspace{ws.Name: ws}, os.TempDir())
 	eng.Spawn = func(f func()) { f() }
 	eng.Log = log.New(io.Discard, "", 0)
@@ -111,7 +116,11 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 	eng.Exec = func(dir, command string) ([]byte, error) {
 		outcome := choose(probeState, def.States[probeState].On)
 		record(probeState, outcome)
-		raw, _ := json.Marshal(map[string]any{"outcome": outcome, "url": "dry-url", "status": "dry"})
+		result := map[string]any{"outcome": outcome, "url": "dry-url", "status": "dry"}
+		for _, f := range fields[probeState] {
+			setPath(result, strings.Split(f, "."), "dry-"+f)
+		}
+		raw, _ := json.Marshal(result)
 		return raw, nil
 	}
 
@@ -125,12 +134,23 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 	if err != nil {
 		return err
 	}
+	// notify steps transition inside the engine, too fast for the walk loop to
+	// see; their edges are covered from the run's own event trail
+	defer func() {
+		events, _ := st.EventsForRun(run.ID)
+		for _, ev := range events {
+			if ev.Kind == "notice" && def.States[ev.State].Step == core.StepNotify {
+				record(ev.State, "ok")
+			}
+		}
+	}()
 
 	for i := 0; i < 200; i++ {
 		cur, err := st.GetRun(run.ID)
 		if err != nil {
 			return err
 		}
+		visited[cur.State] = true
 		switch cur.Status {
 		case core.StatusDone:
 			fmt.Fprintf(out, "  -> terminal %q\n", cur.State)
@@ -170,17 +190,20 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 			}
 		case core.StatusWaiting:
 			state := def.States[cur.State]
-			// Probe-armed waits fire their probe; the synthetic probe (agent
-			// or command) makes the walk's choice itself — including
-			// "timeout", which lands on the same edge as the timer would.
-			if p := firstProbe(state); p != nil {
-				probeState = cur.State
-				fmt.Fprintf(out, "  wait %s: firing probe\n", cur.State)
-				clk.Advance(p.Every.D() + time.Second)
-				eng.Tick()
-				continue
-			}
+			// Choose the outcome first, THEN pick the arm that can deliver
+			// it: a state armed with both events and a probe (building waits
+			// on the builder AND probes for its death) must be able to walk
+			// its event edges, not only the probe's.
 			outcome := choose(cur.State, state.On)
+			if arm := armFor(state, outcome); arm == nil {
+				if p := firstProbe(state); p != nil && outcome != "timeout" {
+					probeState = cur.State
+					fmt.Fprintf(out, "  wait %s: firing probe\n", cur.State)
+					clk.Advance(p.Every.D() + time.Second)
+					eng.Tick()
+					continue
+				}
+			}
 			if arm := armFor(state, outcome); arm != nil {
 				key := ""
 				if arm.Correlate != "" {
@@ -194,6 +217,8 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 			} else {
 				record(cur.State, "timeout")
 				fmt.Fprintf(out, "  wait %s: firing timeout\n", cur.State)
+				// the state's own probe timer comes due in the same tick
+				probeState = cur.State
 				clk.Advance(maxTimeout(state) + time.Second)
 				eng.Tick()
 			}
@@ -239,7 +264,10 @@ func (r *synthRunner) Run(_ context.Context, req runner.Request) (*runner.Result
 // bestByDist picks the outcome whose target minimizes dist. With avoidGates,
 // gate targets only win when nothing else leads anywhere (failure gates on
 // short paths must not seduce the homeward walk off the main line).
-func bestByDist(def *core.WorkflowDefinition, on map[string]string, dist map[string]int, avoidGates bool) string {
+// visited breaks distance ties away from states the walk has already been
+// through: two edges equally far from a terminal, one of them a loop back, is
+// exactly the shape that made a happy path look like a budget overrun.
+func bestByDist(def *core.WorkflowDefinition, on map[string]string, dist map[string]int, avoidGates bool, visited map[string]bool) string {
 	outcomes := make([]string, 0, len(on))
 	for o := range on {
 		outcomes = append(outcomes, o)
@@ -252,7 +280,11 @@ func bestByDist(def *core.WorkflowDefinition, on map[string]string, dist map[str
 			if !allowGate && def.States[t].Step == core.StepGate {
 				continue
 			}
-			if d, ok := dist[t]; ok && d < bestD {
+			d, ok := dist[t]
+			if !ok {
+				continue
+			}
+			if d < bestD || (d == bestD && visited[on[best]] && !visited[t]) {
 				best, bestD = o, d
 			}
 		}
@@ -265,6 +297,9 @@ func bestByDist(def *core.WorkflowDefinition, on map[string]string, dist map[str
 	}
 	if b := pick(true); b != "" {
 		return b
+	}
+	if len(outcomes) == 0 {
+		return ""
 	}
 	return outcomes[0]
 }
@@ -393,6 +428,7 @@ func referencedFields(def *core.WorkflowDefinition) map[string][]string {
 		for _, v := range st.In {
 			add(v)
 		}
+		add(st.Message)
 		if st.Gate != nil {
 			add(st.Gate.Payload)
 		}
