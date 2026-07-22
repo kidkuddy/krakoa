@@ -15,11 +15,14 @@ export const clock = (t: string) =>
 export const usd = (x: number) => (x ? `$${x.toFixed(x < 0.1 ? 4 : 2)}` : "");
 
 /* F5 — who has the ball. Every thread is exactly one of these. */
-export type Ball = "your-turn" | "machine" | "world" | "done" | "dead";
+export type Ball = "your-turn" | "blocked" | "machine" | "world" | "done" | "dead";
 
 export function ball(runs: Run[], gates: Gate[]): Ball {
   const ids = new Set(runs.map(r => r.ID));
   if (gates.some(g => ids.has(g.RunID))) return "your-turn";
+  // blocked is the world not being ready — nothing to answer, but it will not
+  // move until you fix the real thing
+  if (runs.some(r => r.Status === "blocked")) return "blocked";
   if (runs.some(r => r.Status === "running")) return "machine";
   if (runs.some(r => r.Status === "waiting" || r.Status === "queued")) return "world";
   if (runs.some(r => r.Status === "failed" || r.Status === "canceled") &&
@@ -29,6 +32,7 @@ export function ball(runs: Run[], gates: Gate[]): Ball {
 
 export const ballCopy: Record<Ball, { label: string; cls: string }> = {
   "your-turn": { label: "YOUR TURN", cls: "bg-amber-400 text-black" },
+  blocked: { label: "blocked on a prerequisite", cls: "bg-orange-500/20 text-orange-300" },
   machine: { label: "machine working", cls: "bg-blue-500/20 text-blue-300" },
   world: { label: "world working — nothing needed", cls: "bg-zinc-700/60 text-zinc-300" },
   done: { label: "done", cls: "bg-emerald-500/15 text-emerald-300" },

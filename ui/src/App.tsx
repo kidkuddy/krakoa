@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchDetail, fetchGates, fetchRuns, type Gate, type Run, type RunDetail } from "./api";
-import { ago, ball, ballCopy, clock, cx, dur, harvestLinks, retro, usd } from "./lib";
+import { ago, ball, ballCopy, clock, cx, dur, harvestLinks, retro, usd, type Ball } from "./lib";
 import { Card, Chip, Dot, Label, Mono, statusCls } from "./components/bits";
 import { GateCard } from "./components/GateCard";
 import { RunFlow } from "./components/RunFlow";
@@ -25,7 +25,7 @@ function group(runs: Run[], gates: Gate[]): Thread[] {
   }));
   const rank = (t: Thread) => {
     const b = ball(t.runs, t.gates);
-    return b === "your-turn" ? 0 : b === "machine" ? 1 : b === "world" ? 2 : b === "dead" ? 3 : 4;
+    return b === "your-turn" ? 0 : b === "blocked" ? 1 : b === "machine" ? 2 : b === "world" ? 3 : b === "dead" ? 4 : 5;
   };
   return threads.sort((a, b) => rank(a) - rank(b) ||
     Math.max(...b.runs.map(r => +new Date(r.UpdatedAt))) - Math.max(...a.runs.map(r => +new Date(r.UpdatedAt))));
@@ -43,6 +43,7 @@ export default function App() {
   const [sel, setSel] = useState(readHash());
   const [err, setErr] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
+  const [filter, setFilter] = useState<Ball | "all">("all");
   const selRef = useRef(sel);
   selRef.current = sel;
 
@@ -91,17 +92,104 @@ export default function App() {
         <span className="ml-auto text-[11px] text-zinc-600">{err ? `daemon unreachable (${err})` : `updated ${new Date().toLocaleTimeString()}`}</span>
       </header>
 
-      {/* engine-level gates (watcher failures) always on top */}
-      {gates.filter(g => !g.RunID).map(g => <div key={g.ID} className="mb-4"><GateCard gate={g} onDone={refresh} /></div>)}
+      {/* Attention (real decisions, undelivered pings) above infra noise —
+          13 identical watcher gates once WERE the page. */}
+      <UndeliveredStrip gates={gates} />
+      {engineGates(gates).attention.map(g => <div key={g.ID} className="mb-4"><GateCard gate={g} onDone={refresh} /></div>)}
+      <InfraStrip gates={engineGates(gates).infra} onDone={refresh} />
 
       {!current ? (
         <div className="flex flex-col gap-3">
-          {threads.map(t => <ThreadCard key={t.key} t={t} onOpen={() => nav(t.key)} />)}
+          <FilterBar value={filter} onChange={setFilter} counts={countByBall(threads)} />
+          {threads.filter(t => filter === "all" || ball(t.runs, t.gates) === filter)
+                  .map(t => <ThreadCard key={t.key} t={t} onOpen={() => nav(t.key)} />)}
           {!threads.length && !err && <div className="py-20 text-center text-zinc-600">no runs yet</div>}
         </div>
       ) : (
         <ThreadDetail t={current} details={details} selRun={sel.run} onRun={id => nav(sel.thread, id)} onGate={refresh} />
       )}
+    </div>
+  );
+}
+
+/* Engine-level gates split by what they are: a decision you owe (attention)
+   vs a watcher telling you it is broken (infra). Infra collapses to one row
+   per watcher with a count. */
+function engineGates(gates: Gate[]) {
+  const engine = gates.filter(g => !g.RunID);
+  return {
+    attention: engine.filter(g => !g.State.startsWith("watcher:")),
+    infra: engine.filter(g => g.State.startsWith("watcher:")),
+  };
+}
+
+function InfraStrip({ gates, onDone }: { gates: Gate[]; onDone: () => void }) {
+  const [open, setOpen] = useState<string | null>(null);
+  if (!gates.length) return null;
+  const byWatcher = new Map<string, Gate[]>();
+  gates.forEach(g => byWatcher.set(g.State, [...(byWatcher.get(g.State) ?? []), g]));
+  return (
+    <div className="mb-4 flex flex-col gap-2">
+      {[...byWatcher.entries()].map(([state, gs]) => (
+        <div key={state} className="rounded-xl border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-[12px]">
+          <div className="flex items-baseline gap-2">
+            <Chip cls="bg-zinc-700/60 text-zinc-300">infra</Chip>
+            <span className="text-zinc-300">{state.replace("watcher:", "")}</span>
+            <span className="text-zinc-500">{gs.length > 1 ? `${gs.length} open gates` : "1 open gate"}</span>
+            <a className="ml-auto cursor-pointer text-blue-400"
+               onClick={() => setOpen(open === state ? null : state)}>{open === state ? "hide" : "expand"}</a>
+          </div>
+          <div className="mt-1 text-zinc-500">{gs[gs.length - 1].Payload}</div>
+          {open === state && (
+            <div className="mt-2 flex flex-col gap-2">
+              {gs.map(g => <GateCard key={g.ID} gate={g} onDone={onDone} />)}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* An undelivered gate exists ONLY here — nothing else in the world knows it
+   was never seen. So it gets the loudest treatment on the page. */
+function UndeliveredStrip({ gates }: { gates: Gate[] }) {
+  const bad = gates.filter(g => Object.values(g.Delivery ?? {}).some(v => v !== "ok"));
+  if (!bad.length) return null;
+  return (
+    <div className="mb-4 rounded-xl border-2 border-red-500 bg-red-950/40 p-3">
+      <div className="text-[13px] font-semibold text-red-200">
+        ⚠ {bad.length} gate{bad.length > 1 ? "s were" : " was"} never delivered — visible only on this page
+      </div>
+      {bad.map(g => (
+        <div key={g.ID} className="mt-1 text-[12px] text-red-300">
+          <Mono>{g.ID}</Mono> {g.Payload.slice(0, 120)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function countByBall(threads: Thread[]) {
+  const c: Record<string, number> = {};
+  threads.forEach(t => { const b = ball(t.runs, t.gates); c[b] = (c[b] ?? 0) + 1; });
+  return c;
+}
+
+function FilterBar({ value, onChange, counts }: {
+  value: Ball | "all"; onChange: (b: Ball | "all") => void; counts: Record<string, number>;
+}) {
+  const opts: (Ball | "all")[] = ["all", "your-turn", "blocked", "machine", "world", "dead", "done"];
+  return (
+    <div className="flex flex-wrap gap-2 text-[12px]">
+      {opts.map(o => (
+        <button key={o} onClick={() => onChange(o)}
+          className={cx("rounded-md border px-2 py-0.5",
+            value === o ? "border-blue-500 bg-blue-500/10 text-blue-200" : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600")}>
+          {o === "all" ? "all" : ballCopy[o].label.toLowerCase()}
+          {o !== "all" && counts[o] ? ` ${counts[o]}` : ""}
+        </button>
+      ))}
     </div>
   );
 }
@@ -119,9 +207,11 @@ function ThreadCard({ t, onOpen }: { t: Thread; onOpen: () => void }) {
       </div>
       <div className="mt-1 text-[12px] text-zinc-400">{line}</div>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-[12px]">
-        {t.runs.map(r => (
-          <span key={r.ID} className="rounded-md border border-zinc-800 bg-zinc-950/60 px-2 py-0.5">
-            <span className="text-zinc-500">{r.Workflow}</span> · {r.State} <Chip cls={statusCls[r.Status]}>{r.Status}</Chip>
+        {byWorkflow(t.runs).map(w => (
+          <span key={w.workflow} className="rounded-md border border-zinc-800 bg-zinc-950/60 px-2 py-0.5">
+            <span className="text-zinc-500">{w.workflow}</span>
+            {w.count > 1 && <span className="text-zinc-600"> ×{w.count}</span>}
+            {" · "}{w.newest.State} <Chip cls={statusCls[w.newest.Status]}>{w.newest.Status}</Chip>
           </span>
         ))}
         <span className="ml-auto text-zinc-500">{ago(latest.UpdatedAt)} ago</span>
@@ -131,6 +221,18 @@ function ThreadCard({ t, onOpen }: { t: Thread; onOpen: () => void }) {
       )}
     </Card>
   );
+}
+
+/* Six sweeper runs used to read "review-sweeper · done done" six times. One
+   line per WORKFLOW, with a count and the newest run's state. */
+function byWorkflow(runs: Run[]) {
+  const by = new Map<string, Run[]>();
+  runs.forEach(r => by.set(r.Workflow, [...(by.get(r.Workflow) ?? []), r]));
+  return [...by.entries()].map(([workflow, rs]) => ({
+    workflow,
+    count: rs.length,
+    newest: rs.reduce((a, b) => (a.UpdatedAt > b.UpdatedAt ? a : b)),
+  }));
 }
 
 /* F5's plain-language line: what is happening + what (if anything) is needed. */
@@ -144,8 +246,24 @@ function plainLanguage(t: Thread, b: ReturnType<typeof ball>): string {
     const r = t.runs.find(x => x.Status === "waiting")!;
     return `waiting on the world in ${r.State} — ${ago(r.UpdatedAt)} so far, nothing needed from you`;
   }
-  if (b === "dead") return "ended without finishing";
+  if (b === "blocked") {
+    const r = t.runs.find(x => x.Status === "blocked")!;
+    const why = (r.Context?.blocked as { check?: string; detail?: string } | undefined);
+    return `blocked on ${why?.check ?? "a prerequisite"} in ${r.State} — resumes by itself when it passes${why?.detail ? ` (${why.detail})` : ""}`;
+  }
+  if (b === "dead") {
+    const r = t.runs.find(x => x.Status === "failed" || x.Status === "canceled");
+    return r ? `ended without finishing in ${r.State} — ${deadReason(r)}` : "ended without finishing";
+  }
   return "all runs finished";
+}
+
+/* A dead run said "ended without finishing" and nothing else. Say why. */
+function deadReason(r: Run): string {
+  const blocked = r.Context?.blocked as { check?: string } | undefined;
+  if (blocked?.check) return `last blocked on ${blocked.check}`;
+  if (r.Status === "canceled") return "canceled";
+  return `abandoned at ${r.State}`;
 }
 
 function ThreadDetail({ t, details, selRun, onRun, onGate }: {
