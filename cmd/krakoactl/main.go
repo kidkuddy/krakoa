@@ -176,6 +176,17 @@ func cmdRun(args []string) error {
 		return err
 	}
 	fmt.Printf("run %v started (state %v, status %v)\n", run["ID"], run["State"], run["Status"])
+	// Binding the Slack thread was a manual step the model had to remember,
+	// and when it forgot, every gate for that task landed top-level. A session
+	// spawned by niffty carries its thread in the environment — bind it here.
+	if ts := os.Getenv("NIFFTY_TASK"); ts != "" {
+		id, _ := run["ID"].(string)
+		if err := call("POST", "/v1/runs/"+id+"/bind", map[string]any{"Kind": "slack_ts", "Value": ts}, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not bind slack thread %s: %v\n", ts, err)
+		} else {
+			fmt.Printf("bound to slack thread %s\n", ts)
+		}
+	}
 	return nil
 }
 
