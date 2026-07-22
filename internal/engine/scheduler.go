@@ -41,6 +41,8 @@ func (e *Engine) Tick() {
 		}
 	}
 	e.sweepStalledSignals()
+	e.sweepChecks()
+	e.sweepDeliveries()
 }
 
 // StallGuardAfter is how long a buffered signal may sit unusable before the
@@ -506,6 +508,7 @@ func (e *Engine) settleSweep(wsName, name string, events []EmittedEvent, ok bool
 	if ok {
 		delete(e.watcherHealth, key)
 		e.closeWatcherGatesLocked(wsName, watcherStatePrefix+name)
+		e.resumeBlockedLocked(wsName, watcherStatePrefix+name)
 		e.mu.Unlock()
 		e.HandleWatcherEvents(wsName, name, events)
 		return
@@ -630,8 +633,35 @@ func (e *Engine) applyWatcherChoiceLocked(g *core.Gate, response string) {
 	default: // retry
 		in = 0
 	}
+	// Pausing means pausing everything: the timer AND the runs this watcher
+	// spawned. They come back with it (a clean sweep resumes them).
+	if in > 0 {
+		e.blockWatcherRunsLocked(g.Workspace, name)
+	} else {
+		e.resumeBlockedLocked(g.Workspace, g.State)
+	}
 	e.rescheduleWatcherLocked(g.Workspace, name, in)
 	e.event("", g.State, "watcher-"+response, map[string]any{"next_sweep_in": in.String()}, g.Workspace)
+}
+
+// blockWatcherRunsLocked parks the runs a paused watcher spawned, keyed on
+// the watcher itself so the existing resume machinery brings them back.
+func (e *Engine) blockWatcherRunsLocked(wsName, name string) {
+	parent := watcherStatePrefix + name
+	runs, err := e.Store.ListRuns(core.StatusRunning, core.StatusWaiting, core.StatusQueued)
+	if err != nil {
+		return
+	}
+	for _, run := range runs {
+		if run.Workspace != wsName || run.Parent != parent {
+			continue
+		}
+		_, def, err := e.def(run.Workspace, run.Workflow)
+		if err != nil {
+			continue
+		}
+		e.blockLocked(def, *run, parent, "watcher "+name+" paused")
+	}
 }
 
 // rescheduleWatcherLocked moves a watcher's next sweep. Pausing is a far-out

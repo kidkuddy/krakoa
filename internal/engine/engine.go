@@ -61,6 +61,17 @@ type Engine struct {
 	// lastStallSweep throttles the buffered-signal stall guard.
 	lastStallSweep time.Time
 
+	// checks is the live verdict per "ws/check" — the board `krakoactl
+	// checks` prints and the gate `requires` consults. Probing happens off
+	// the lock; only the verdict is stored here.
+	checks         map[string]*checkResult
+	lastCheckSweep time.Time
+
+	// gateNags tracks redelivery/nagging per open gate (in-memory: a restart
+	// costs at most one extra ping).
+	gateNags          map[string]*gateNag
+	lastDeliverySweep time.Time
+
 	// Exec runs a deterministic command probe (cwd = workspace dir) and
 	// returns its stdout. Overridable for dry-run and tests.
 	Exec func(dir, command string) ([]byte, error)
@@ -114,6 +125,7 @@ func New(st *store.Store, rn runner.Runner, clk Clock, wss map[string]*workspace
 		DataDir:       dataDir,
 		Spawn:         func(f func()) { go f() },
 		watcherHealth: map[string]*watcherState{},
+		checks:        map[string]*checkResult{},
 		Exec:          realExec,
 		Log:           log.New(os.Stdout, "", log.LstdFlags),
 	}
@@ -179,6 +191,21 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 		State: def.Start, Status: core.StatusQueued,
 		Inputs: inputs, Context: map[string]any{}, EdgeCounts: map[string]int{},
 		Parent: parent, CreatedAt: now, UpdatedAt: now,
+	}
+	// Every task is bound to an environment, and the environment decides the
+	// trunk it branches from, the branch the MR targets and the namespace the
+	// rollout probe watches. Stamping it as context makes all of that one
+	// $env.<field> away, everywhere.
+	if name, _ := inputs["env"].(string); name != "" && ws.Envs != nil {
+		facts, ok := ws.Envs[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown env %q (workspace %s declares %v)", name, wsName, sortedKeys(ws.Envs))
+		}
+		env := map[string]any{"name": name}
+		for k, v := range facts {
+			env[k] = v
+		}
+		run.Context["env"] = env
 	}
 	if err := e.Store.CreateRun(run); err != nil {
 		return nil, err
@@ -307,6 +334,10 @@ func (e *Engine) projectBoardLocked(run *core.Run) {
 }
 
 func (e *Engine) admitLocked(def *core.WorkflowDefinition, run *core.Run) {
+	if check, detail := e.checkFailingLocked(run.Workspace, def.Requires); check != "" {
+		e.blockLocked(def, *run, check, detail)
+		return
+	}
 	e.event(run.ID, run.State, "run-admitted", nil, run.Workspace)
 	d := core.Enter(def, *run)
 	e.applyLocked(def, d)
@@ -321,10 +352,21 @@ func (e *Engine) applyLocked(def *core.WorkflowDefinition, d core.Decision) {
 		return
 	}
 	e.stampThreadLocked(def, &run)
+	// Just-in-time preconditions: entering a state whose world isn't ready
+	// blocks instead of failing expensively (only rollout-wait needs the
+	// cluster, so only rollout-wait pays for checking it).
+	if !run.Status.Terminal() {
+		if check, detail := e.checkFailingLocked(run.Workspace, def.States[run.State].Requires); check != "" {
+			e.blockLocked(def, run, check, detail)
+			return
+		}
+	}
 	for _, a := range d.Actions {
 		switch act := a.(type) {
 		case core.ActionRunAgent:
 			e.startAgentStepLocked(def, run, act)
+		case core.ActionNotify:
+			e.notifyStepLocked(def, run, act)
 		case core.ActionOpenGate:
 			e.openGateLocked(run, act)
 		case core.ActionArmWait:
@@ -362,6 +404,38 @@ func (e *Engine) admitNextLocked(def *core.WorkflowDefinition, ws, wf string) {
 	e.admitLocked(def, next)
 }
 
+// notifyStepLocked delivers a lifecycle line through the same channel gates
+// use — in-thread, instant, $0 — and advances. It replaces spawning a haiku
+// session per sentence, whose curl had no thread_ts at all, which is why
+// every lifecycle notice landed top-level.
+func (e *Engine) notifyStepLocked(def *core.WorkflowDefinition, run core.Run, act core.ActionNotify) {
+	// The last word of a lifecycle is the one worth a turn of your session;
+	// the ones in the middle are progress.
+	kind := core.NoticeProgress
+	if next, ok := def.States[def.States[run.State].On["ok"]]; ok && next.Terminal {
+		kind = core.NoticeDone
+	}
+	e.notifyLocked(&core.Notice{
+		ID: newID("n"), Workspace: run.Workspace, RunID: run.ID, State: act.State,
+		Kind: kind, Text: act.Text,
+	})
+	runID, state := run.ID, act.State
+	e.pending = append(e.pending, func() { e.notifyDone(def, runID, state) })
+}
+
+// notifyDone advances past a notify state. Delivery outcome never gates the
+// workflow: an undelivered notice is the retry loop's problem, not the run's.
+func (e *Engine) notifyDone(def *core.WorkflowDefinition, runID, state string) {
+	defer e.drain()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	run, err := e.Store.GetRun(runID)
+	if err != nil || run.State != state || run.Status != core.StatusRunning {
+		return
+	}
+	e.applyLocked(def, core.Advance(def, *run, "ok", nil))
+}
+
 // --- gates ---
 
 func (e *Engine) openGateLocked(run core.Run, act core.ActionOpenGate) {
@@ -386,24 +460,35 @@ func (e *Engine) openGateLocked(run core.Run, act core.ActionOpenGate) {
 		return
 	}
 	e.event(run.ID, act.State, "gate-opened", map[string]any{"gate": g.ID, "kind": string(act.Kind), "payload": act.Payload}, run.Workspace)
-	e.deliver(g)
+	e.deliverLocked(g)
 }
 
-func (e *Engine) deliver(g *core.Gate) {
-	delivery := map[string]string{}
-	for _, ch := range e.Channels {
-		if err := ch.Deliver(g); err != nil {
-			delivery[ch.Name()] = err.Error()
-			e.Log.Printf("deliver gate %s via %s: %v", g.ID, ch.Name(), err)
-			e.event(g.RunID, g.State, "gate-delivery-failed", map[string]any{"gate": g.ID, "channel": ch.Name(), "error": err.Error()}, g.Workspace)
-		} else {
-			delivery[ch.Name()] = "ok"
-			e.event(g.RunID, g.State, "gate-delivered", map[string]any{"gate": g.ID, "channel": ch.Name()}, g.Workspace)
+// deliverLocked queues delivery off the engine lock (a Slack post is up to
+// 10s of I/O) and records the per-channel outcome when it lands. Failures are
+// retried by sweepDeliveries until the gate is delivered or answered.
+func (e *Engine) deliverLocked(g *core.Gate) {
+	channels := e.Channels
+	e.pending = append(e.pending, func() {
+		delivery := map[string]string{}
+		for _, ch := range channels {
+			err := ch.Deliver(g)
+			e.mu.Lock()
+			if err != nil {
+				delivery[ch.Name()] = err.Error()
+				e.Log.Printf("deliver gate %s via %s: %v", g.ID, ch.Name(), err)
+				e.event(g.RunID, g.State, "gate-delivery-failed", map[string]any{"gate": g.ID, "channel": ch.Name(), "error": err.Error()}, g.Workspace)
+			} else {
+				delivery[ch.Name()] = "ok"
+				e.event(g.RunID, g.State, "gate-delivered", map[string]any{"gate": g.ID, "channel": ch.Name()}, g.Workspace)
+			}
+			e.mu.Unlock()
 		}
-	}
-	if err := e.Store.SetGateDelivery(g.ID, delivery); err != nil {
-		e.Log.Printf("record delivery %s: %v", g.ID, err)
-	}
+		e.mu.Lock()
+		if err := e.Store.SetGateDelivery(g.ID, delivery); err != nil {
+			e.Log.Printf("record delivery %s: %v", g.ID, err)
+		}
+		e.mu.Unlock()
+	})
 }
 
 // parkLocked flips the run to needs-attention and raises the fixed gate.
@@ -645,12 +730,38 @@ func (e *Engine) stepFailed(def *core.WorkflowDefinition, runID string, st *core
 	if err != nil || run.State != st.State || run.Status != core.StatusRunning {
 		return
 	}
-	if st.Attempt <= act.Retry {
-		e.event(runID, st.State, "step-retry", map[string]any{"attempt": st.Attempt + 1}, def.Workspace)
+	// A step that died before writing its handoff is a mechanical failure,
+	// not a decision — re-run it once before spending a human. Every observed
+	// instance succeeded on retry.
+	if st.Attempt <= act.Retry || (st.Attempt == 1 && isHandoffFailure(reason)) {
+		e.event(runID, st.State, "step-retry", map[string]any{"attempt": st.Attempt + 1, "reason": reason}, def.Workspace)
 		e.startAgentStepLocked(def, *run, act)
 		return
 	}
-	e.parkLocked(*run, fmt.Sprintf("step %s failed after %d attempt(s): %s", st.State, st.Attempt, reason))
+	e.parkLocked(*run, plainly(st.State, st.Attempt, reason))
+}
+
+// isHandoffFailure reports whether a step failed at the handoff contract
+// rather than at the work itself.
+func isHandoffFailure(reason string) bool {
+	return strings.Contains(reason, "result.json")
+}
+
+// plainly turns a step failure into something a human can act on. The gate
+// used to leak "result.json not found in handoff dir", which says nothing
+// about what happened or what retry would do.
+func plainly(state string, attempts int, reason string) string {
+	switch {
+	case strings.Contains(reason, "result.json not found"):
+		return fmt.Sprintf("the %s step crashed before writing its result (%d attempts) — retry re-runs it from the start", state, attempts)
+	case strings.Contains(reason, "not valid JSON"), strings.Contains(reason, "invalid result"):
+		return fmt.Sprintf("the %s step finished but its result was unreadable (%d attempts) — retry re-runs it", state, attempts)
+	case strings.Contains(reason, "is not one of this step's transitions"):
+		return fmt.Sprintf("the %s step reported an outcome the workflow has no route for: %s", state, reason)
+	case strings.Contains(reason, "runner:"):
+		return fmt.Sprintf("the %s step could not start (%s) — retry tries again", state, strings.TrimPrefix(reason, "runner: "))
+	}
+	return fmt.Sprintf("the %s step failed after %d attempt(s): %s", state, attempts, reason)
 }
 
 // --- wait states, events, signals ---

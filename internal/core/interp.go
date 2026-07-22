@@ -25,6 +25,12 @@ type ActionArmWait struct {
 	Arms  []WaitArm
 }
 
+// ActionNotify says one line to the human and transitions on "ok".
+type ActionNotify struct {
+	State string
+	Text  string // resolved
+}
+
 // ActionPark opens a needs-attention gate (options: retry, abandon).
 type ActionPark struct {
 	State  string
@@ -79,6 +85,12 @@ func Enter(def *WorkflowDefinition, run Run) Decision {
 			Kind:    st.Gate.Kind,
 			Payload: Interpolate(&run, st.Gate.Payload),
 			Options: st.Gate.Options,
+		}}}
+	case StepNotify:
+		run.Status = StatusRunning
+		return Decision{Run: run, Actions: []Action{ActionNotify{
+			State: run.State,
+			Text:  Interpolate(&run, st.Message),
 		}}}
 	case StepWait:
 		run.Status = StatusWaiting

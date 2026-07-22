@@ -27,8 +27,8 @@ func TestLoadValid(t *testing.T) {
 	if _, ok := ws.Skills["glab-ops"]; !ok {
 		t.Errorf("skills = %v", ws.Skills)
 	}
-	if len(ws.Doctor) != 2 || ws.Doctor[0].URL == "" || ws.Doctor[1].Command != "echo hello" || ws.Doctor[1].Fail[0] != "boom" {
-		t.Errorf("doctor checks = %+v", ws.Doctor)
+	if len(ws.Checks) != 2 || ws.Checks["fake-daemon"].URL == "" || ws.Checks["fake-cli"].Command != "echo hello" || ws.Checks["fake-cli"].Fail[0] != "boom" {
+		t.Errorf("checks = %+v", ws.Checks)
 	}
 	w := ws.Watchers["draft-mr-watch"]
 	if w == nil || w.Every.D() != 10*time.Minute || w.Mode != "spawn" {
@@ -122,10 +122,10 @@ func TestLoadBroken(t *testing.T) {
 		wantErr(t, errs, "typo_field")
 	})
 
-	t.Run("doctor check with both command and url", func(t *testing.T) {
+	t.Run("check with both command and url", func(t *testing.T) {
 		errs := broken(t, func(dir string) {
 			f := filepath.Join(dir, "workspace.yaml")
-			body := "name: testws\ndoctor:\n  - {name: bad, command: echo x, url: http://x/}\n"
+			body := "name: testws\nchecks:\n  bad: {command: echo x, url: http://x/}\n"
 			os.WriteFile(f, []byte(body), 0o644)
 		})
 		wantErr(t, errs, "exactly one of command/url")

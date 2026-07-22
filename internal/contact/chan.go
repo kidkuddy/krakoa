@@ -67,6 +67,28 @@ func (c *Chan) Deliver(g *core.Gate) error {
 	return nil // ambient: never blocking, never a delivery failure
 }
 
+// Notify pings only for things that actually need the human. Progress
+// chatter through an avatar is exactly the noise F11 exists to avoid.
+func (c *Chan) Notify(n *core.Notice) error {
+	var text, subtitle string
+	switch n.Kind {
+	case core.NoticeDone:
+		text = "マスター、デプロイできたよ！確認してね。"
+		subtitle = "Merged and deployed — your check needed"
+	case core.NoticeStuck:
+		text = "マスター、詰まっちゃった…助けて。"
+		subtitle = "A step is stuck — needs you"
+	case core.NoticeBlocked:
+		text = "マスター、先に進めないの。"
+		subtitle = "Blocked on a credential — needs you"
+	default:
+		return nil // progress and unblocked stay silent
+	}
+	body, _ := json.Marshal(map[string]string{"text": text, "subtitle": subtitle})
+	c.post(body)
+	return nil // ambient: never a delivery failure
+}
+
 func (c *Chan) post(body []byte) error {
 	resp, err := c.HTTP.Post(c.URL+"/ping", "application/json", bytes.NewReader(body))
 	if err != nil {

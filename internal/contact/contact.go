@@ -6,6 +6,7 @@ package contact
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,8 @@ import (
 type Channel interface {
 	Name() string
 	Deliver(g *core.Gate) error
+	// Notify delivers a one-way message (no response expected).
+	Notify(n *core.Notice) error
 }
 
 // Console writes gates to the daemon log. Always configured; the audit trail
@@ -35,6 +38,11 @@ func (c *Console) Deliver(g *core.Gate) error {
 	}
 	_, err := fmt.Fprintf(c.W, "GATE %s (%s) run=%s state=%s: %s%s\n  answer with: krakoactl answer %s <response>\n",
 		g.ID, g.Kind, g.RunID, g.State, g.Payload, opts, g.ID)
+	return err
+}
+
+func (c *Console) Notify(n *core.Notice) error {
+	_, err := fmt.Fprintf(c.W, "NOTICE %s (%s) run=%s: %s\n", n.ID, n.Kind, n.RunID, n.Text)
 	return err
 }
 
@@ -60,38 +68,113 @@ func NewNiffty(url, to string) *Niffty {
 
 func (n *Niffty) Name() string { return "niffty" }
 
+// event is what niffty's /tasks/{ts}/event accepts: the thread's agent
+// session renders it (one renderer, P9) and decides whether to act.
+type event struct {
+	Kind      string   `json:"kind"`
+	EventID   string   `json:"event_id"`
+	RunID     string   `json:"run_id,omitempty"`
+	GateID    string   `json:"gate_id,omitempty"`
+	Text      string   `json:"text"`
+	Options   []string `json:"options,omitempty"`
+	Questions []string `json:"questions,omitempty"`
+	// Wake asks niffty to spend a turn: gate questions, done-and-deployed,
+	// and stuck steps only. Routine progress is posted, never woken on.
+	Wake bool `json:"wake"`
+}
+
 func (n *Niffty) Deliver(g *core.Gate) error {
-	var text string
+	var canvas string
 	if g.Kind == core.GateQuestion && n.Bin != "" && len(g.Questions) > 0 {
 		if link, err := n.createCanvas(g); err == nil {
 			if n.SaveRef != nil {
 				n.SaveRef(g.RunID, "canvas:"+g.ID, link)
 			}
-			text = fmt.Sprintf("⏸ YOUR TURN — questions on %s. Fill the ANSWER blocks in the canvas, then reply done (or run: krakoactl harvest %s)\n%s", g.RunID, g.ID, link)
+			canvas = link
 		}
 	}
-	if text == "" {
-		text = fmt.Sprintf("⏸ YOUR TURN — [krakoa gate %s] %s", g.ID, g.Payload)
-		if len(g.Options) > 0 {
-			text += "\noptions: " + strings.Join(g.Options, " | ")
-		}
-		text += fmt.Sprintf("\nanswer: krakoactl answer %s <response>", g.ID)
+	return n.post(g.RunID, event{
+		Kind: "gate", EventID: g.ID, RunID: g.RunID, GateID: g.ID,
+		Text:      gateText(g, canvas),
+		Options:   g.Options,
+		Questions: g.Questions,
+		Wake:      true,
+	})
+}
+
+func (n *Niffty) Notify(no *core.Notice) error {
+	return n.post(no.RunID, event{
+		Kind: string(no.Kind), EventID: no.ID, RunID: no.RunID, Text: no.Text,
+		Wake: no.Kind == core.NoticeDone || no.Kind == core.NoticeStuck || no.Kind == core.NoticeBlocked,
+	})
+}
+
+// gateText renders a gate for a human. A question gate NEVER falls back to
+// the workflow payload: that template interpolates a Go slice and arrives as
+// "[Q1 …? Q2 …?]". The questions travel structurally, so they are rendered
+// structurally.
+func gateText(g *core.Gate, canvas string) string {
+	if canvas != "" {
+		return fmt.Sprintf("⏸ YOUR TURN — questions on %s. Fill the ANSWER blocks in the canvas, then reply done (or run: krakoactl harvest %s)\n%s", g.RunID, g.ID, canvas)
 	}
-	payload := map[string]string{"to": n.To, "text": text}
+	var b strings.Builder
+	fmt.Fprintf(&b, "⏸ YOUR TURN — [krakoa gate %s] %s", g.ID, g.Payload)
+	for i, q := range g.Questions {
+		fmt.Fprintf(&b, "\n%d. %s", i+1, q)
+	}
+	if len(g.Questions) > 0 {
+		b.WriteString("\nreply in this thread, numbered.")
+	}
+	if len(g.Options) > 0 {
+		b.WriteString("\noptions: " + strings.Join(g.Options, " | "))
+	}
+	fmt.Fprintf(&b, "\nanswer: krakoactl answer %s <response>", g.ID)
+	return b.String()
+}
+
+// post routes through the thread's agent session when the run has a Slack
+// thread bound, and falls back to a raw DM otherwise (or when niffty says
+// the session is gone).
+func (n *Niffty) post(runID string, ev event) error {
+	ts := ""
 	if n.ThreadTS != nil {
-		if ts := n.ThreadTS(g.RunID); ts != "" {
-			payload["thread_ts"] = ts
-		}
+		ts = n.ThreadTS(runID)
 	}
-	body, _ := json.Marshal(payload)
-	resp, err := n.HTTP.Post(n.URL+"/send", "application/json", bytes.NewReader(body))
+	if ts != "" {
+		err := n.postJSON("/tasks/"+ts+"/event", ev)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errNoSession) {
+			return err
+		}
+		// session gone: say so, then relay raw into the same thread
+		ev.Text += "\n(the thread's session is gone — relayed raw)"
+	}
+	body := map[string]string{"to": n.To, "text": ev.Text}
+	if ts != "" {
+		body["thread_ts"] = ts
+	}
+	return n.postJSON("/send", body)
+}
+
+// errNoSession marks "this thread has no live agent session" — a routing
+// fact, not a delivery failure.
+var errNoSession = errors.New("no session for thread")
+
+func (n *Niffty) postJSON(path string, v any) error {
+	body, _ := json.Marshal(v)
+	resp, err := n.HTTP.Post(n.URL+path, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("niffty down: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
+		return errNoSession
+	}
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
-		return fmt.Errorf("niffty /send: %s: %s", resp.Status, b)
+		return fmt.Errorf("niffty %s: %s: %s", path, resp.Status, b)
 	}
 	return nil
 }

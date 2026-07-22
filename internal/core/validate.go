@@ -49,7 +49,7 @@ func Validate(def *WorkflowDefinition) []error {
 
 	terminals := 0
 	for _, name := range names {
-		if name == "input" || name == "last" {
+		if name == "input" || name == "last" || name == "env" {
 			fail("state %s: reserved name (template namespace)", name)
 		}
 		st := def.States[name]
@@ -92,6 +92,13 @@ func Validate(def *WorkflowDefinition) []error {
 				}
 			default:
 				fail("state %s: unknown gate kind %q", name, st.Gate.Kind)
+			}
+		case StepNotify:
+			if st.Message == "" {
+				fail("state %s: notify step requires message", name)
+			}
+			if _, ok := st.On["ok"]; !ok {
+				fail("state %s: notify step requires a transition on \"ok\"", name)
 			}
 		case StepWait:
 			if len(st.Arms) == 0 {

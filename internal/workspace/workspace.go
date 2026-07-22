@@ -18,9 +18,16 @@ import (
 )
 
 type Meta struct {
-	Name        string        `yaml:"name"`
-	Description string        `yaml:"description,omitempty"`
-	Doctor      []DoctorCheck `yaml:"doctor,omitempty"`
+	Name        string `yaml:"name"`
+	Description string `yaml:"description,omitempty"`
+	// Checks are named prerequisite probes. Workflows reference them by name
+	// through `requires:`, krakoactl doctor runs the same registry, and the
+	// engine re-probes them to unblock runs — one definition, three consumers.
+	Checks map[string]DoctorCheck `yaml:"checks,omitempty"`
+	// Envs maps an environment name (dev|staging|prod) to its facts — the
+	// trunk branch it deploys from, the namespace suffix it rolls into.
+	// Every task is bound to one; the workflow reads them as $env.<field>.
+	Envs map[string]map[string]string `yaml:"envs,omitempty"`
 	// Repos maps logical repo identifiers (workflow inputs, e.g. a GitLab
 	// path) to local clone paths — agent working folders resolve through
 	// it, so one workflow serves many repos.
@@ -54,8 +61,11 @@ type Workspace struct {
 	Description string
 	Path        string
 	GitVersion  string
-	Doctor      []DoctorCheck
+	Checks      map[string]DoctorCheck
+	// Doctor is Checks in name order — the list form krakoactl doctor reads.
+	Doctor []DoctorCheck
 
+	Envs      map[string]map[string]string
 	Repos     map[string]string
 	Workflows map[string]*core.WorkflowDefinition
 	Agents    map[string]*core.AgentSpec
@@ -88,15 +98,17 @@ func Load(path string) (*Workspace, []error) {
 	ws.Name = meta.Name
 	ws.Description = meta.Description
 	ws.GitVersion = gitVersion(path)
-	ws.Doctor = meta.Doctor
 	ws.Repos = meta.Repos
-	for i, dc := range meta.Doctor {
-		if dc.Name == "" {
-			fail("workspace.yaml: doctor check %d: name is required", i)
-		}
+	ws.Envs = meta.Envs
+	ws.Checks = map[string]DoctorCheck{}
+	for _, name := range sortedKeys(meta.Checks) {
+		dc := meta.Checks[name]
+		dc.Name = name
 		if (dc.Command == "") == (dc.URL == "") {
-			fail("workspace.yaml: doctor check %q: exactly one of command/url required", dc.Name)
+			fail("workspace.yaml: check %q: exactly one of command/url required", name)
 		}
+		ws.Checks[name] = dc
+		ws.Doctor = append(ws.Doctor, dc)
 	}
 
 	if err := readYAML(filepath.Join(path, "policies.yaml"), &ws.Policies); err != nil && !os.IsNotExist(err) {
@@ -224,6 +236,12 @@ func (ws *Workspace) checkRefs(def *core.WorkflowDefinition) []error {
 		}
 	}
 
+	for _, c := range def.Requires {
+		if _, ok := ws.Checks[c]; !ok {
+			fail("requires unknown check %q", c)
+		}
+	}
+
 	names := make([]string, 0, len(def.States))
 	for n := range def.States {
 		names = append(names, n)
@@ -232,6 +250,11 @@ func (ws *Workspace) checkRefs(def *core.WorkflowDefinition) []error {
 
 	for _, name := range names {
 		st := def.States[name]
+		for _, c := range st.Requires {
+			if _, ok := ws.Checks[c]; !ok {
+				fail("state %s: requires unknown check %q", name, c)
+			}
+		}
 		if st.Step == core.StepAgent {
 			if _, ok := ws.Agents[st.Agent]; !ok {
 				fail("state %s: unknown agent %q", name, st.Agent)

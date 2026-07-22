@@ -30,6 +30,8 @@ const usage = `usage: krakoactl <command> [args]
   bind <run-id> --slack-ts <ts>                      bind a Slack thread to a run's thread
   harvest <gate-id>                                  answer a question gate from its canvas
   why <run-id>                                       render a run's timeline
+  checks                                             live prerequisite board (what is blocking runs)
+  resume <run-id>                                    un-block / re-enter a parked run
   emit <event> --workspace <ws> [--key k] [--run id] [--payload json]
   workspace validate <path>                          load + validate a workspace dir
   workspace dry-run <path> <workflow>                simulate a workflow end to end
@@ -61,6 +63,10 @@ func main() {
 		err = cmdHarvest(os.Args[2:])
 	case "why":
 		err = cmdWhy(os.Args[2:])
+	case "checks":
+		err = cmdChecks()
+	case "resume":
+		err = cmdResume(os.Args[2:])
 	case "emit":
 		err = cmdEmit(os.Args[2:])
 	case "workspace":
@@ -220,6 +226,53 @@ func cmdThreads() error {
 		}
 		fmt.Printf("%-14v %-5v %-30v %-9s %s\n", t["Thread"], t["Runs"], t["Statuses"], cost, last)
 	}
+	return nil
+}
+
+// cmdChecks prints the live prerequisite board: what is failing, since when,
+// how many runs it is holding, and the fix.
+func cmdChecks() error {
+	var rows []struct {
+		Workspace, Name, Detail, Fix string
+		OK, Probed                   bool
+		FailedSince                  time.Time
+		Blocked                      int `json:"blocked_runs"`
+	}
+	if err := call("GET", "/v1/checks", nil, &rows); err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Println("no checks declared")
+		return nil
+	}
+	for _, r := range rows {
+		mark := "ok  "
+		switch {
+		case !r.Probed:
+			mark = "?   "
+		case !r.OK:
+			mark = "FAIL"
+		}
+		line := fmt.Sprintf("[%s] %s/%s  %s", mark, r.Workspace, r.Name, r.Detail)
+		if r.Blocked > 0 {
+			line += fmt.Sprintf("  — holding %d run(s)", r.Blocked)
+		}
+		fmt.Println(line)
+		if !r.OK && r.Probed && r.Fix != "" {
+			fmt.Printf("       fix: %s\n", r.Fix)
+		}
+	}
+	return nil
+}
+
+func cmdResume(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: resume <run-id>")
+	}
+	if err := call("POST", "/v1/runs/"+args[0]+"/resume", nil, nil); err != nil {
+		return err
+	}
+	fmt.Printf("resumed %s\n", args[0])
 	return nil
 }
 

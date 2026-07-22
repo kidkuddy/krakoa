@@ -9,6 +9,10 @@ const (
 	StatusRunning        RunStatus = "running"
 	StatusWaiting        RunStatus = "waiting" // parked on a wait state's arms
 	StatusGated          RunStatus = "gated"   // parked on a human gate
+	// StatusBlocked is the world not being ready (an expired token, a dead
+	// daemon): not a decision like gated, not progress like waiting. It
+	// releases its concurrency slot and auto-resumes when the check passes.
+	StatusBlocked RunStatus = "blocked"
 	StatusDone           RunStatus = "done"
 	StatusFailed         RunStatus = "failed"
 	StatusNeedsAttention RunStatus = "needs-attention"

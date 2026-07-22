@@ -9,7 +9,11 @@ const (
 	StepAgent StepKind = "agent"
 	StepGate  StepKind = "gate"
 	StepWait  StepKind = "wait"
-	StepSpawn StepKind = "spawn" // parsed but rejected by the validator until a use case needs it
+	// StepNotify says one line to the human through the same contact channel
+	// gates use — thread-aware, instant, free. It replaces spawning an agent
+	// session per sentence.
+	StepNotify StepKind = "notify"
+	StepSpawn  StepKind = "spawn" // parsed but rejected by the validator until a use case needs it
 )
 
 // GateKind is what we ask the human for.
@@ -92,8 +96,16 @@ type State struct {
 	// gate
 	Gate *GateSpec `yaml:"gate,omitempty"`
 
+	// notify
+	Message string `yaml:"message,omitempty"` // template; transitions on "ok"
+
 	// wait
 	Arms []WaitArm `yaml:"arms,omitempty"`
+
+	// Requires names workspace checks that must pass to ENTER this state
+	// (e.g. only rollout-wait needs the cluster). A failing check blocks the
+	// run instead of letting it fail expensively.
+	Requires []string `yaml:"requires,omitempty"`
 
 	// transitions: outcome -> next state
 	On map[string]string `yaml:"on,omitempty"`
@@ -112,9 +124,11 @@ type WorkflowDefinition struct {
 	// Thread is a template naming the piece of work this run serves (e.g.
 	// "$filing.ticket_id" or "$input.ticket_id"). Stamped on the run as
 	// soon as it resolves; runs sharing a thread key group together.
-	Thread string           `yaml:"thread,omitempty"`
-	Start  string           `yaml:"start"`
-	States map[string]State `yaml:"states"`
+	Thread string `yaml:"thread,omitempty"`
+	// Requires names workspace checks that must pass at admission.
+	Requires []string         `yaml:"requires,omitempty"`
+	Start    string           `yaml:"start"`
+	States   map[string]State `yaml:"states"`
 }
 
 // AgentSpec is a named agent description, referenced by workflow states.

@@ -264,6 +264,18 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		writeJSON(w, 200, map[string]string{"value": eng.ThreadRefForRun(r.PathValue("id"), kind)})
 	})
 
+	mux.HandleFunc("GET /v1/checks", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, eng.ChecksBoard())
+	})
+
+	mux.HandleFunc("POST /v1/runs/{id}/resume", func(w http.ResponseWriter, r *http.Request) {
+		if err := eng.ResumeRun(r.PathValue("id")); err != nil {
+			fail(w, 409, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+
 	mux.HandleFunc("GET /v1/gates", func(w http.ResponseWriter, r *http.Request) {
 		gates, err := st.OpenGates()
 		if err != nil {

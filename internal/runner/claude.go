@@ -51,6 +51,11 @@ $KRAKOA_HANDOFF/result.json with at least:
 result fields your instructions ask for. The workflow cannot proceed
 without this file.
 
+Write it ATOMICALLY — to $KRAKOA_HANDOFF/result.json.tmp first, then
+rename it over result.json (` + "`mv`" + `, one syscall). A step killed
+mid-write otherwise leaves a truncated file, which reads as a corrupt
+result instead of a missing one.
+
 Write result.json THE MOMENT the outcome is known — immediately, before
 any cleanup, wrap-up, summaries, or final checks. Writing it is part of
 the work, not an afterthought: sessions have died between "done" and
