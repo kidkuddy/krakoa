@@ -1,0 +1,14 @@
+name: daily
+# A schedule-triggered ritual: the trigger kind that was parsed and validated
+# for weeks while nothing in the engine ever fired it. Completes immediately,
+# so consecutive slots each get their own run.
+trigger: {kind: schedule, cron: "0 8,17 * * *"}
+concurrency: 1
+start: doing
+states:
+  doing:
+    step: agent
+    agent: notifier
+    instruction: do the daily thing
+    on: {ok: done}
+  done: {terminal: true}

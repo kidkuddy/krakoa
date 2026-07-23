@@ -33,6 +33,8 @@ func (e *Engine) Tick() {
 			e.fireProbe(t)
 		case "watcher":
 			e.fireWatcher(t)
+		case "schedule":
+			e.fireSchedule(t)
 		default:
 			e.Log.Printf("unknown timer kind %q (id %d)", t.Kind, t.ID)
 			e.mu.Lock()
@@ -805,6 +807,7 @@ func (e *Engine) Recover() {
 	defer e.mu.Unlock()
 
 	e.armWatchersLocked()
+	e.armSchedulesLocked()
 
 	runs, err := e.Store.ListRuns(core.StatusRunning)
 	if err != nil {
@@ -857,6 +860,114 @@ func (e *Engine) armWatchersLocked() {
 			})
 		}
 	}
+}
+
+// scheduleStatePrefix marks runs and events a cron trigger produced.
+const scheduleStatePrefix = "schedule:"
+
+// armSchedulesLocked ensures every schedule-triggered workflow has exactly one
+// active timer, set to its next fire. A workflow whose cron was EDITED gets its
+// timer replaced — the old fire_at would otherwise outlive the change, which is
+// the failure mode you notice at 08:00 the next morning and not before.
+func (e *Engine) armSchedulesLocked() {
+	timers, err := e.Store.ActiveTimers()
+	if err != nil {
+		e.Log.Printf("arm schedules: %v", err)
+		return
+	}
+	have := map[string]*store.Timer{}
+	for _, t := range timers {
+		if t.Kind != "schedule" {
+			continue
+		}
+		wsName, _ := t.Payload["workspace"].(string)
+		wfName, _ := t.Payload["workflow"].(string)
+		have[wsName+"/"+wfName] = t
+	}
+	live := map[string]bool{}
+	for _, ws := range e.Workspaces {
+		for _, def := range ws.Workflows {
+			if def.Trigger.Kind != core.TriggerSchedule {
+				continue
+			}
+			key := ws.Name + "/" + def.Name
+			live[key] = true
+			sched, err := core.ParseCron(def.Trigger.Cron)
+			if err != nil {
+				e.Log.Printf("schedule %s: %v", key, err)
+				continue
+			}
+			if t := have[key]; t != nil {
+				if cron, _ := t.Payload["cron"].(string); cron == def.Trigger.Cron {
+					continue // already armed on the current expression
+				}
+				e.Store.DisarmTimer(t.ID)
+			}
+			next, err := sched.Next(e.Clock.Now())
+			if err != nil {
+				e.Log.Printf("schedule %s: %v", key, err)
+				continue
+			}
+			e.Store.ArmTimer(&store.Timer{
+				Kind: "schedule", FireAt: next,
+				Payload: map[string]any{"workspace": ws.Name, "workflow": def.Name, "cron": def.Trigger.Cron},
+			})
+			e.Log.Printf("schedule %s armed: %s -> %s", key, def.Trigger.Cron, next.Format("Mon 15:04"))
+		}
+	}
+	// A workflow that stopped being scheduled must stop firing.
+	for key, t := range have {
+		if !live[key] {
+			e.Store.DisarmTimer(t.ID)
+		}
+	}
+}
+
+// fireSchedule starts one scheduled run and re-arms for the next fire.
+//
+// Catch-up policy: fire the LATEST missed slot once, never replay all. A Mac
+// asleep from Friday to Monday would otherwise wake to three days of backlogged
+// runs, which is worse than the one it actually wants. Re-arming from `now`
+// rather than from the timer's fire_at is what makes that true.
+func (e *Engine) fireSchedule(t *store.Timer) {
+	defer e.drain()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	wsName, _ := t.Payload["workspace"].(string)
+	wfName, _ := t.Payload["workflow"].(string)
+	_, def, err := e.def(wsName, wfName)
+	if err != nil {
+		e.Log.Printf("schedule %s/%s: %v (disarming)", wsName, wfName, err)
+		e.Store.DisarmTimer(t.ID)
+		return
+	}
+
+	if sched, err := core.ParseCron(def.Trigger.Cron); err == nil {
+		if next, err := sched.Next(e.Clock.Now()); err == nil {
+			e.Store.Reschedule(t.ID, next)
+		}
+	}
+
+	if def.Trigger.SkipIfRunning {
+		active, err := e.Store.CountActive(wsName, wfName)
+		if err == nil && active > 0 {
+			// Not a failure: the open run already carries the signal, and a
+			// second one about the same backlog is how a ritual becomes noise.
+			e.event("", scheduleStatePrefix+wfName, "schedule-skipped",
+				map[string]any{"workflow": wfName, "active": active}, wsName)
+			return
+		}
+	}
+
+	run, err := e.startRunLocked(wsName, wfName, nil, scheduleStatePrefix+wfName)
+	if err != nil {
+		e.Log.Printf("schedule %s/%s: %v", wsName, wfName, err)
+		e.event("", scheduleStatePrefix+wfName, "schedule-failed",
+			map[string]any{"workflow": wfName, "error": err.Error()}, wsName)
+		return
+	}
+	e.event(run.ID, run.State, "schedule-fired", map[string]any{"workflow": wfName, "cron": def.Trigger.Cron}, wsName)
 }
 
 // RunForever is the daemon loop: tick on an interval until ctx ends.
