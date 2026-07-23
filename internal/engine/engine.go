@@ -140,6 +140,50 @@ func (e *Engine) def(ws, wf string) (*workspace.Workspace, *core.WorkflowDefinit
 	return w, d, nil
 }
 
+// runDef resolves a run's definition AND backfills context the definition now
+// needs but the run predates. Workflow edits land on in-flight runs (the engine
+// always interprets the CURRENT definition), so a run started before `env`
+// existed would hit "resolve $env.trunk: env not found" and park — which is
+// exactly what happened to three live runs the day env shipped.
+func (e *Engine) runDef(run *core.Run) (*core.WorkflowDefinition, error) {
+	ws, def, err := e.def(run.Workspace, run.Workflow)
+	if err != nil {
+		return nil, err
+	}
+	e.backfillEnvLocked(ws, def, run)
+	return def, nil
+}
+
+func (e *Engine) backfillEnvLocked(ws *workspace.Workspace, def *core.WorkflowDefinition, run *core.Run) {
+	if run == nil || len(ws.Envs) == 0 {
+		return
+	}
+	if _, ok := run.Context["env"]; ok {
+		return
+	}
+	name, _ := run.Inputs["env"].(string)
+	if name == "" {
+		name = def.Inputs["env"].Default
+	}
+	facts, ok := ws.Envs[name]
+	if !ok {
+		return
+	}
+	env := map[string]any{"name": name}
+	for k, v := range facts {
+		env[k] = v
+	}
+	if run.Context == nil {
+		run.Context = map[string]any{}
+	}
+	run.Context["env"] = env
+	if err := e.Store.SaveRun(run); err != nil {
+		e.Log.Printf("backfill env on %s: %v", run.ID, err)
+		return
+	}
+	e.event(run.ID, run.State, "env-backfilled", map[string]any{"env": name}, run.Workspace)
+}
+
 func newID(prefix string) string {
 	b := make([]byte, 4)
 	rand.Read(b)
@@ -543,7 +587,7 @@ func (e *Engine) answerGateLocked(gateID, response string, answers map[string]an
 	if err != nil {
 		return err
 	}
-	_, def, err := e.def(run.Workspace, run.Workflow)
+	def, err := e.runDef(run)
 	if err != nil {
 		return err
 	}
@@ -870,7 +914,7 @@ func (e *Engine) routeEventLocked(wsName string, ev EmittedEvent) string {
 		if run.Workspace != wsName {
 			continue
 		}
-		_, def, err := e.def(run.Workspace, run.Workflow)
+		def, err := e.runDef(run)
 		if err != nil {
 			continue
 		}
@@ -903,7 +947,7 @@ func matchRun(def *core.WorkflowDefinition, run *core.Run, ev EmittedEvent) bool
 
 // eventToRunLocked advances a waiting run or buffers for later.
 func (e *Engine) eventToRunLocked(run *core.Run, ev EmittedEvent) string {
-	_, def, err := e.def(run.Workspace, run.Workflow)
+	def, err := e.runDef(run)
 	if err != nil {
 		return err.Error()
 	}

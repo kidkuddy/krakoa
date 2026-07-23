@@ -48,3 +48,40 @@ func TestRequiresBlocksAndAutoResumes(t *testing.T) {
 		t.Fatalf("run did not resume: %s/%s", r.State, r.Status)
 	}
 }
+
+// A workflow edit lands on runs that are already in flight — the engine always
+// interprets the CURRENT definition. A run started before `env` existed hit
+// "resolve $env.trunk: env not found" and parked, three times live.
+func TestEnvBackfilledOnRunsThatPredateIt(t *testing.T) {
+	v := setup(t)
+	ws := v.eng.Workspaces["demo"]
+	ws.Envs = map[string]map[string]string{"dev": {"trunk": "development", "ns_suffix": "-dev"}}
+	def := ws.Workflows["task-lifecycle"]
+	def.Inputs["env"] = core.InputSpec{Type: "string", Default: "dev"}
+
+	old := &core.Run{
+		ID: "old-run", Workspace: "demo", Workflow: "task-lifecycle",
+		State: def.Start, Status: core.StatusWaiting,
+		Inputs: map[string]any{"idea": "x"}, Context: map[string]any{}, EdgeCounts: map[string]int{},
+		CreatedAt: v.clock.Now(), UpdatedAt: v.clock.Now(),
+	}
+	if err := v.st.CreateRun(old); err != nil {
+		t.Fatal(err)
+	}
+
+	v.eng.mu.Lock()
+	if _, err := v.eng.runDef(old); err != nil {
+		t.Fatal(err)
+	}
+	v.eng.mu.Unlock()
+
+	env, _ := old.Context["env"].(map[string]any)
+	if env["trunk"] != "development" {
+		t.Fatalf("env not backfilled: %+v", old.Context)
+	}
+	// and it must be durable, not just in memory
+	fresh := v.mustRun(t, "old-run")
+	if e, _ := fresh.Context["env"].(map[string]any); e["trunk"] != "development" {
+		t.Fatalf("backfill not persisted: %+v", fresh.Context)
+	}
+}

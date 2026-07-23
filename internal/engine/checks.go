@@ -182,7 +182,7 @@ func (e *Engine) runsBlockedOnLocked(wsName, check string) []*core.Run {
 func (e *Engine) resumeBlockedLocked(wsName, check string) int {
 	n := 0
 	for _, run := range e.runsBlockedOnLocked(wsName, check) {
-		_, def, err := e.def(run.Workspace, run.Workflow)
+		def, err := e.runDef(run)
 		if err != nil {
 			continue
 		}
@@ -221,7 +221,7 @@ func (e *Engine) ResumeRun(runID string) error {
 		e.Store.CancelGate(g.ID, e.Clock.Now())
 	}
 	delete(run.Context, "blocked")
-	_, def, err := e.def(run.Workspace, run.Workflow)
+	def, err := e.runDef(run)
 	if err != nil {
 		return err
 	}

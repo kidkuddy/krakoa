@@ -82,7 +82,7 @@ func (e *Engine) sweepStalledSignals() {
 		if g, _ := e.Store.OpenGateForRun(run.ID); g != nil {
 			continue
 		}
-		_, def, err := e.def(run.Workspace, run.Workflow)
+		def, err := e.runDef(run)
 		if err != nil {
 			continue
 		}
@@ -198,7 +198,7 @@ func (e *Engine) resolveStallLocked(g *core.Gate, event, response string) {
 		e.event(run.ID, run.State, "signal-discarded", map[string]any{"event": event}, run.Workspace)
 		return
 	}
-	_, def, err := e.def(run.Workspace, run.Workflow)
+	def, err := e.runDef(run)
 	if err != nil {
 		return
 	}
@@ -223,7 +223,7 @@ func (e *Engine) fireTimeout(t *store.Timer) {
 	if err != nil || run.Status != core.StatusWaiting || run.State != t.State {
 		return // stale timer; the run moved on
 	}
-	_, def, err := e.def(run.Workspace, run.Workflow)
+	def, err := e.runDef(run)
 	if err != nil {
 		return
 	}
@@ -245,7 +245,7 @@ func (e *Engine) fireProbe(t *store.Timer) {
 		return
 	}
 	e.Store.Reschedule(t.ID, e.Clock.Now().Add(t.Every))
-	_, def, err := e.def(run.Workspace, run.Workflow)
+	def, err := e.runDef(run)
 	if err != nil {
 		e.mu.Unlock()
 		return
@@ -656,7 +656,7 @@ func (e *Engine) blockWatcherRunsLocked(wsName, name string) {
 		if run.Workspace != wsName || run.Parent != parent {
 			continue
 		}
-		_, def, err := e.def(run.Workspace, run.Workflow)
+		def, err := e.runDef(run)
 		if err != nil {
 			continue
 		}
@@ -809,7 +809,7 @@ func (e *Engine) Recover() {
 		return
 	}
 	for _, run := range runs {
-		_, def, err := e.def(run.Workspace, run.Workflow)
+		def, err := e.runDef(run)
 		if err != nil {
 			e.Log.Printf("recover %s: %v (workspace gone or invalid — parking)", run.ID, err)
 			e.parkLocked(*run, "recovery: "+err.Error())
