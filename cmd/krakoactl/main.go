@@ -32,6 +32,7 @@ const usage = `usage: krakoactl <command> [args]
   why <run-id>                                       render a run's timeline
   checks                                             live prerequisite board (what is blocking runs)
   resume <run-id>                                    un-block / re-enter a parked run
+  cancel <run-id> [reason...]                        stop a run wherever it stands
   emit <event> --workspace <ws> [--key k] [--run id] [--payload json]
   workspace validate <path>                          load + validate a workspace dir
   workspace dry-run <path> <workflow>                simulate a workflow end to end
@@ -67,6 +68,8 @@ func main() {
 		err = cmdChecks()
 	case "resume":
 		err = cmdResume(os.Args[2:])
+	case "cancel":
+		err = cmdCancel(os.Args[2:])
 	case "emit":
 		err = cmdEmit(os.Args[2:])
 	case "workspace":
@@ -284,6 +287,18 @@ func cmdResume(args []string) error {
 		return err
 	}
 	fmt.Printf("resumed %s\n", args[0])
+	return nil
+}
+
+func cmdCancel(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: cancel <run-id> [reason...]")
+	}
+	reason := strings.Join(args[1:], " ")
+	if err := call("POST", "/v1/runs/"+args[0]+"/cancel", map[string]any{"reason": reason}, nil); err != nil {
+		return err
+	}
+	fmt.Printf("canceled %s\n", args[0])
 	return nil
 }
 

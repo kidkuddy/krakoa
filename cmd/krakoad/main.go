@@ -268,6 +268,18 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		writeJSON(w, 200, eng.ChecksBoard())
 	})
 
+	mux.HandleFunc("POST /v1/runs/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if err := eng.CancelRun(r.PathValue("id"), body.Reason); err != nil {
+			fail(w, 409, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+
 	mux.HandleFunc("POST /v1/runs/{id}/resume", func(w http.ResponseWriter, r *http.Request) {
 		if err := eng.ResumeRun(r.PathValue("id")); err != nil {
 			fail(w, 409, err)

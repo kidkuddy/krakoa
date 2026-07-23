@@ -230,6 +230,37 @@ func (e *Engine) ResumeRun(runID string) error {
 	return nil
 }
 
+// CancelRun stops a run wherever it stands. Without this the only way to drop
+// a run that was not sitting on a gate was to wait out an 8h timer or edit the
+// database — an agent asked to "abandon this task" had nothing to call, and
+// went hunting the filesystem instead.
+func (e *Engine) CancelRun(runID, reason string) error {
+	e.mu.Lock()
+	defer func() { e.mu.Unlock(); e.drain() }()
+	run, err := e.Store.GetRun(runID)
+	if err != nil {
+		return err
+	}
+	if run.Status.Terminal() {
+		return fmt.Errorf("run %s already ended (%s)", runID, run.Status)
+	}
+	if g, _ := e.Store.OpenGateForRun(runID); g != nil {
+		e.Store.CancelGate(g.ID, e.Clock.Now())
+	}
+	e.Store.DisarmRunTimers(runID)
+	run.Status = core.StatusCanceled
+	run.UpdatedAt = e.Clock.Now()
+	if err := e.Store.SaveRun(run); err != nil {
+		return err
+	}
+	e.event(runID, run.State, "run-canceled", map[string]any{"reason": reason, "by": "operator"}, run.Workspace)
+	if _, def, err := e.def(run.Workspace, run.Workflow); err == nil {
+		e.admitNextLocked(def, run.Workspace, run.Workflow) // the slot is free
+	}
+	e.projectBoardLocked(run)
+	return nil
+}
+
 // CheckBoard is one row of `krakoactl checks`.
 type CheckBoard struct {
 	Workspace   string    `json:"workspace"`
