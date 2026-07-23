@@ -217,13 +217,17 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 		inputs = map[string]any{}
 	}
 	for name, spec := range def.Inputs {
-		if _, ok := inputs[name]; !ok {
-			if spec.Default != "" {
-				inputs[name] = spec.Default
-			} else if spec.Required {
-				return nil, fmt.Errorf("missing required input %q", name)
-			}
+		if _, ok := inputs[name]; ok {
+			continue
 		}
+		if spec.Required {
+			return nil, fmt.Errorf("missing required input %q", name)
+		}
+		// Every declared optional input is materialized, including one whose
+		// default is the empty string — `default: ""` used to be
+		// indistinguishable from "no default", so the input was absent and
+		// $input.<name> parked the run instead of resolving to "".
+		inputs[name] = spec.Default
 	}
 	now := e.Clock.Now()
 	run := &core.Run{

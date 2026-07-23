@@ -85,3 +85,22 @@ func TestEnvBackfilledOnRunsThatPredateIt(t *testing.T) {
 		t.Fatalf("backfill not persisted: %+v", fresh.Context)
 	}
 }
+
+// `default: ""` is a default, not the absence of one: an optional input
+// declared that way must still exist, or every $input.<name> that references
+// it parks the run.
+func TestEmptyStringDefaultIsApplied(t *testing.T) {
+	v := setup(t)
+	def := v.eng.Workspaces["demo"].Workflows["task-lifecycle"]
+	def.Inputs["note"] = core.InputSpec{Type: "string", Default: ""}
+
+	v.run.on("refining", ok("outcome", "ok", "ticket", "t"))
+	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := v.mustRun(t, run.ID).Inputs
+	if _, ok := got["note"]; !ok {
+		t.Fatalf("optional input with an empty default is missing: %v", got)
+	}
+}
