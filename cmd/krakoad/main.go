@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -128,22 +129,21 @@ func main() {
 		cn.Only = splitList(os.Getenv("KRAKOA_CHAN_WORKSPACES"))
 		eng.Channels = append(eng.Channels, cn)
 	}
-	// momo: Matrix threads for the personal workspace. Same shape as niffty —
-	// one thread per piece of work, bound through the run's thread key.
-	if p := os.Getenv("KRAKOA_MOMO_PROFILE"); p != "" {
-		mo := &contact.Momo{
-			Bin:        env("KRAKOA_MOMO_BIN", filepath.Join(home, ".local", "bin", "momo")),
-			Profile:    p,
-			Room:       os.Getenv("KRAKOA_MOMO_ROOM"),
-			Only:       splitList(os.Getenv("KRAKOA_MOMO_WORKSPACES")),
-			ThreadRoot: func(runID string) string { return eng.ThreadRefForRun(runID, "momo_root") },
-			SaveRef:    func(runID, kind, value string) { eng.Bind(runID, kind, value) },
-			Log:        log.Printf,
+	// Workspace-declared channels. The engine learns nothing about the tool on
+	// the other end: it execs a script with JSON on stdin. Declaration is also
+	// the scope — a channel serves the workspace that declared it, so there is
+	// no routing to configure.
+	for _, ws := range workspaces {
+		for _, name := range sortedNames(ws.Contact) {
+			c := ws.Contact[name]
+			eng.Channels = append(eng.Channels, &contact.Script{
+				ChannelName: name, Workspace: ws.Name, Dir: ws.Path,
+				Command: c.Command, Timeout: c.Timeout.D(),
+				Refs:    func(runID string) map[string]string { return eng.ThreadRefsForRun(runID) },
+				SaveRef: func(runID, kind, value string) { eng.Bind(runID, kind, value) },
+			})
+			log.Printf("contact %s/%s -> %s", ws.Name, name, c.Command)
 		}
-		if mo.Room == "" {
-			log.Print("momo: KRAKOA_MOMO_ROOM unset — messages open threads in the default DM but replies stay top-level")
-		}
-		eng.Channels = append(eng.Channels, mo)
 	}
 
 	eng.Recover()
@@ -372,4 +372,14 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 	})
 
 	return mux
+}
+
+// sortedNames keeps channel construction deterministic.
+func sortedNames[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

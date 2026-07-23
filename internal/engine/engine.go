@@ -361,6 +361,17 @@ func (e *Engine) ThreadRefForRun(runID, kind string) string {
 	return v
 }
 
+// ThreadRefsForRun returns every contact binding on a run's thread. Contact
+// scripts receive the whole map; the engine never interprets a key.
+func (e *Engine) ThreadRefsForRun(runID string) map[string]string {
+	run, err := e.Store.GetRun(runID)
+	if err != nil {
+		return nil
+	}
+	refs, _ := e.Store.ThreadRefs(EffectiveThread(run))
+	return refs
+}
+
 // projectBoardLocked recomputes a thread's lane and queues the board upsert
 // (exec happens outside the lock). Lanes: open gate > queued > active >
 // all-terminal; "done" is the human's to set, the engine stops at
