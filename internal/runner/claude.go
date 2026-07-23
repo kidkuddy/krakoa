@@ -169,6 +169,17 @@ func buildPrompt(req Request) string {
 	if req.Spec.WorkingFolder != "" && !req.Spec.Worktree {
 		b.WriteString("\n\nWorking folder: " + req.Spec.WorkingFolder)
 	}
+	if req.Spec.WorkingFolder == "" {
+		// An agent with no checkout that is asked about code goes looking for
+		// one — across Downloads, Music and / — and every one of those is a
+		// permission prompt on someone's laptop. Say plainly that there is
+		// nothing to find.
+		b.WriteString("\n\nYou have NO repository and NO checkout: your working directory is a" +
+			" scratch dir that exists only for your handoff file. Everything you need is in the" +
+			" inputs above. Never search the filesystem for a repo, a clone or a source tree —" +
+			" if the work seems to require one, that is a mismatch to report in your result," +
+			" not something to go hunting for.")
+	}
 	if req.Spec.ResultSchema != "" {
 		b.WriteString("\n\nYour $KRAKOA_HANDOFF/result.json must match this JSON Schema:\n")
 		b.WriteString(req.Spec.ResultSchema)
