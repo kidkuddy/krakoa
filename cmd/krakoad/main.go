@@ -121,7 +121,15 @@ func main() {
 				SaveRef: func(thread, kind, value string) { st.SetThreadRef(thread, kind, value) },
 				Log:     log.Printf,
 			}
-			eng.Board = board.Upsert
+			// The board is niffty's, so it carries only niffty's workspaces —
+			// without this the personal inbox thread lands on the work list,
+			// which is exactly what happened the first time this ran.
+			eng.Board = func(ws, thread, title, lane string) {
+				if !nf.Serves(ws) {
+					return
+				}
+				board.Upsert(thread, title, lane)
+			}
 		}
 	}
 	if chanURL != "" {

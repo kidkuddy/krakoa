@@ -930,7 +930,7 @@ func TestWorkingFolderFollowsRepoInput(t *testing.T) {
 func TestQuestionsBoardAndBindings(t *testing.T) {
 	v := setup(t)
 	var board [][3]string
-	v.eng.Board = func(thread, title, lane string) { board = append(board, [3]string{thread, title, lane}) }
+	v.eng.Board = func(ws, thread, title, lane string) { board = append(board, [3]string{thread, title, lane}) }
 
 	fr := v.run
 	fr.on("refining", ok("outcome", "ok", "ticket", "d"))

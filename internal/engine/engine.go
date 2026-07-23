@@ -79,8 +79,10 @@ type Engine struct {
 	Exec func(dir, command string) ([]byte, error)
 
 	// Board, when set, projects each thread onto an external board:
-	// Upsert(threadKey, title, lane). Called outside the lock via drain.
-	Board func(thread, title, lane string)
+	// Upsert(workspace, threadKey, title, lane). Called outside the lock via
+	// drain. The workspace rides along because a board belongs to ONE of them:
+	// the personal inbox thread must never appear on the work Slack list.
+	Board func(ws, thread, title, lane string)
 
 	Log *log.Logger
 }
@@ -381,9 +383,15 @@ func (e *Engine) projectBoardLocked(run *core.Run) {
 		return
 	}
 	key := EffectiveThread(run)
-	runs, err := e.Store.RunsByThread(run.Thread)
-	if err != nil || len(runs) == 0 {
-		runs = []*core.Run{run}
+	// A run whose thread template has not resolved yet has an EMPTY thread
+	// key, and RunsByThread("") matches every other unstamped run — across
+	// workspaces. The personal inbox item went onto the board carrying a
+	// callab ticket's idea as its title. Only group by a real key.
+	runs := []*core.Run{run}
+	if run.Thread != "" {
+		if grouped, err := e.Store.RunsByThread(run.Thread); err == nil && len(grouped) > 0 {
+			runs = grouped
+		}
 	}
 	lane := "needs-testing"
 	gates, _ := e.Store.OpenGates()
@@ -421,8 +429,8 @@ func (e *Engine) projectBoardLocked(run *core.Run) {
 		}
 		title = key + " — " + idea
 	}
-	board := e.Board
-	e.pending = append(e.pending, func() { board(key, title, lane) })
+	board, wsName := e.Board, run.Workspace
+	e.pending = append(e.pending, func() { board(wsName, key, title, lane) })
 }
 
 func (e *Engine) admitLocked(def *core.WorkflowDefinition, run *core.Run) {

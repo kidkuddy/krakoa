@@ -49,6 +49,17 @@ func TestChannelsAreScopedToTheirWorkspace(t *testing.T) {
 	v.eng.mu.Unlock()
 	v.eng.drain()
 
+	// The board is one workspace's too. It leaked on the first live run: the
+	// personal inbox thread got an item on the work Slack list, because
+	// scoping the channels had left the board projector global.
+	var projected []string
+	v.eng.Board = func(ws, thread, title, lane string) {
+		if ws != "callab" {
+			t.Errorf("board got a %s thread; it belongs to callab only", ws)
+		}
+		projected = append(projected, ws+"/"+thread)
+	}
+
 	want := map[string][]string{
 		"niffty":  {"g-work"},
 		"momo":    {"g-home", "n-home"},
