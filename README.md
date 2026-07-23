@@ -74,6 +74,11 @@ krakoactl emit <event> --workspace my-ws --key <correlation-key>
 krakoactl doctor                # engine + workspace-declared preflight checks
 ```
 
+`skills/` holds the two Claude Code skills that document this engine —
+`krakoa` (drive the daemon) and `krakoa-create-workflow` (author the YAML).
+`make install` symlinks them into `~/.claude/skills/`, so the repo stays the
+source of truth and a stale skill shows up as a diff.
+
 The audit UI lives at `http://127.0.0.1:7770/ui` — run cards, per-run step
 sidebar with a markdown reading pane, open gates with their unblock
 commands. Self-contained, localhost only.
