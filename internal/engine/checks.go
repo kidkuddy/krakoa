@@ -80,11 +80,16 @@ func (e *Engine) recordCheck(wsName, name string, ok bool, detail string) {
 	if ok {
 		if prev != nil && !prev.ok {
 			n := e.resumeBlockedLocked(wsName, name)
-			e.notifyLocked(&core.Notice{
-				ID: fmt.Sprintf("check-ok-%s-%s-%d", wsName, name, now.Unix()), Workspace: wsName,
-				Kind: core.NoticeUnblocked,
-				Text: fmt.Sprintf("%s is back — %d run(s) resumed.", name, n),
-			})
+			// Only close a loop that was opened: if nothing was ever blocked
+			// and nothing was ever announced, "X is back — 0 runs resumed" is
+			// a notification about nothing.
+			if n > 0 || !prev.lastNag.IsZero() {
+				e.notifyLocked(&core.Notice{
+					ID: fmt.Sprintf("check-ok-%s-%s-%d", wsName, name, now.Unix()), Workspace: wsName,
+					Kind: core.NoticeUnblocked,
+					Text: fmt.Sprintf("%s is back — %d run(s) resumed.", name, n),
+				})
+			}
 		}
 		cur.failedSince, cur.lastNag = time.Time{}, time.Time{}
 		return
