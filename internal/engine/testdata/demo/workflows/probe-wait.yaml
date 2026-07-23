@@ -1,0 +1,24 @@
+name: probe-wait
+# The shape the demo lacked: a wait whose NON-timeout outcome can only be
+# produced by a probe, AND whose route home is longer than the timeout's — so
+# the distance heuristic actively prefers the timeout arm.
+#
+# The dry-run used to consume the forced edge twice: the wait handler took
+# `ready` from the chooser, then the probe asked the chooser AGAIN, got the
+# heuristic's answer (`timeout`, being closer to a terminal) and fired that
+# instead. `checking/ready` was unwalkable and the bug shipped.
+trigger: {kind: manual}
+start: checking
+states:
+  checking:
+    step: wait
+    arms:
+      - probe: {agent: watch-probe, instruction: "is it ready?", every: 1m}
+      - {timeout: 1h}
+    on: {ready: confirming, timeout: gave-up}
+  confirming:
+    step: notify
+    message: "ready after all"
+    on: {ok: done}
+  done: {terminal: true}
+  gave-up: {terminal: true}

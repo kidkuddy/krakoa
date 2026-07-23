@@ -25,6 +25,27 @@ type Channel interface {
 	Notify(n *core.Notice) error
 }
 
+// Scoped is implemented by channels that serve only some workspaces — work
+// pings Slack, personal work pings Matrix. A channel that does not implement
+// it serves every workspace (the console, which is the audit trail).
+type Scoped interface{ Serves(workspace string) bool }
+
+// scope is the workspace allowlist shared by scoped channels. Empty = all,
+// so an unconfigured channel keeps its old everywhere behaviour.
+type scope []string
+
+func (s scope) Serves(ws string) bool {
+	if len(s) == 0 {
+		return true
+	}
+	for _, w := range s {
+		if w == ws {
+			return true
+		}
+	}
+	return false
+}
+
 // Console writes gates to the daemon log. Always configured; the audit trail
 // itself is the events table, written by the engine.
 type Console struct{ W io.Writer }
@@ -54,6 +75,7 @@ type Niffty struct {
 	URL  string // e.g. http://127.0.0.1:7777
 	To   string // relay recipient email
 	Bin  string // niffty CLI (canvas create); empty = plain messages only
+	Only scope  // workspaces served; empty = all
 	HTTP *http.Client
 
 	// ThreadTS resolves a run's bound Slack thread (empty = top-level).
@@ -67,6 +89,8 @@ func NewNiffty(url, to string) *Niffty {
 }
 
 func (n *Niffty) Name() string { return "niffty" }
+
+func (n *Niffty) Serves(ws string) bool { return n.Only.Serves(ws) }
 
 // event is what niffty's /tasks/{ts}/event accepts: the thread's agent
 // session renders it (one renderer, P9) and decides whether to act.

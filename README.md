@@ -131,6 +131,8 @@ declared edge against a synthetic runner before anything touches the world.
 | `KRAKOA_DATA_DIR` | `~/.krakoa/data` | per-step agent homes + handoffs |
 | `KRAKOA_HTTP_ADDR` | `127.0.0.1:7770` | ingress (CLI, emits, UI) |
 | `KRAKOA_NIFFTY_URL` / `KRAKOA_NIFFTY_TO` | — | optional Slack relay channel |
+| `KRAKOA_MOMO_PROFILE` / `KRAKOA_MOMO_ROOM` | — | optional Matrix channel via the momo CLI (a thread per piece of work) |
+| `KRAKOA_{NIFFTY,MOMO,CHAN}_WORKSPACES` | all | comma-separated allowlist: which workspaces a channel carries |
 | `KRAKOA_CLAUDE_BIN` | auto-resolved | claude binary override |
 | `KRAKOA_ADDR` | `http://127.0.0.1:7770` | krakoactl → daemon |
 

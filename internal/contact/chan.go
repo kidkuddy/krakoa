@@ -22,6 +22,7 @@ import (
 type Chan struct {
 	URL      string // e.g. http://localhost:8765
 	StartCmd string // optional headless start attempt (sh -c), tried once
+	Only     scope  // workspaces served; empty = all
 	HTTP     *http.Client
 
 	startOnce sync.Once
@@ -32,6 +33,8 @@ func NewChan(url, startCmd string) *Chan {
 }
 
 func (c *Chan) Name() string { return "chan" }
+
+func (c *Chan) Serves(ws string) bool { return c.Only.Serves(ws) }
 
 func (c *Chan) Deliver(g *core.Gate) error {
 	// severity → phrasing; the avatar speaks Japanese, the subtitle is the

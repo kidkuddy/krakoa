@@ -32,6 +32,18 @@ func env(key, def string) string {
 	return def
 }
 
+// splitList parses a comma-separated env var into a workspace allowlist.
+// Empty stays nil, which every scoped channel reads as "all workspaces".
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags)
 	home, _ := os.UserHomeDir()
@@ -94,6 +106,7 @@ func main() {
 	if nifftyTo != "" {
 		nf := contact.NewNiffty(nifftyURL, nifftyTo)
 		nf.Bin = os.Getenv("KRAKOA_NIFFTY_BIN")
+		nf.Only = splitList(os.Getenv("KRAKOA_NIFFTY_WORKSPACES"))
 		nf.ThreadTS = func(runID string) string { return eng.ThreadRefForRun(runID, "slack_ts") }
 		nf.SaveRef = func(runID, kind, value string) { eng.Bind(runID, kind, value) }
 		eng.Channels = append(eng.Channels, nf)
@@ -111,7 +124,26 @@ func main() {
 		}
 	}
 	if chanURL != "" {
-		eng.Channels = append(eng.Channels, contact.NewChan(chanURL, os.Getenv("KRAKOA_CHAN_START")))
+		cn := contact.NewChan(chanURL, os.Getenv("KRAKOA_CHAN_START"))
+		cn.Only = splitList(os.Getenv("KRAKOA_CHAN_WORKSPACES"))
+		eng.Channels = append(eng.Channels, cn)
+	}
+	// momo: Matrix threads for the personal workspace. Same shape as niffty —
+	// one thread per piece of work, bound through the run's thread key.
+	if p := os.Getenv("KRAKOA_MOMO_PROFILE"); p != "" {
+		mo := &contact.Momo{
+			Bin:        env("KRAKOA_MOMO_BIN", filepath.Join(home, ".local", "bin", "momo")),
+			Profile:    p,
+			Room:       os.Getenv("KRAKOA_MOMO_ROOM"),
+			Only:       splitList(os.Getenv("KRAKOA_MOMO_WORKSPACES")),
+			ThreadRoot: func(runID string) string { return eng.ThreadRefForRun(runID, "momo_root") },
+			SaveRef:    func(runID, kind, value string) { eng.Bind(runID, kind, value) },
+			Log:        log.Printf,
+		}
+		if mo.Room == "" {
+			log.Print("momo: KRAKOA_MOMO_ROOM unset — messages open threads in the default DM but replies stay top-level")
+		}
+		eng.Channels = append(eng.Channels, mo)
 	}
 
 	eng.Recover()

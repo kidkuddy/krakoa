@@ -548,7 +548,7 @@ func (e *Engine) openGateLocked(run core.Run, act core.ActionOpenGate) {
 // 10s of I/O) and records the per-channel outcome when it lands. Failures are
 // retried by sweepDeliveries until the gate is delivered or answered.
 func (e *Engine) deliverLocked(g *core.Gate) {
-	channels := e.Channels
+	channels := e.channelsFor(g.Workspace)
 	e.pending = append(e.pending, func() {
 		delivery := map[string]string{}
 		for _, ch := range channels {
@@ -570,6 +570,20 @@ func (e *Engine) deliverLocked(g *core.Gate) {
 		}
 		e.mu.Unlock()
 	})
+}
+
+// channelsFor returns the channels serving one workspace: callab pings Slack,
+// personal pings Matrix, and the console — which declares no scope — carries
+// everything, so nothing is ever delivered nowhere.
+func (e *Engine) channelsFor(ws string) []contact.Channel {
+	out := make([]contact.Channel, 0, len(e.Channels))
+	for _, ch := range e.Channels {
+		if s, ok := ch.(contact.Scoped); ok && !s.Serves(ws) {
+			continue
+		}
+		out = append(out, ch)
+	}
+	return out
 }
 
 // parkLocked flips the run to needs-attention and raises the fixed gate.
