@@ -67,9 +67,6 @@ type Engine struct {
 	checks         map[string]*checkResult
 	lastCheckSweep time.Time
 
-	// gateNags tracks redelivery/nagging per open gate (in-memory: a restart
-	// costs at most one extra ping).
-	gateNags          map[string]*gateNag
 	lastDeliverySweep time.Time
 
 	// Exec runs a deterministic command probe (cwd = workspace dir) and

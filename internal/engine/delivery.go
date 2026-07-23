@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/kidkuddy/krakoa/internal/core"
+	"github.com/kidkuddy/krakoa/internal/store"
 )
 
 // A gate whose ping was dropped used to be recorded and forgotten — 30 gates
@@ -20,12 +21,6 @@ const (
 	gateEscalateAfter  = 24 * time.Hour
 )
 
-type gateNag struct {
-	lastTry time.Time
-	tries   int
-	escalat bool
-}
-
 func (e *Engine) sweepDeliveries() {
 	defer e.drain()
 	e.mu.Lock()
@@ -35,61 +30,69 @@ func (e *Engine) sweepDeliveries() {
 		return
 	}
 	e.lastDeliverySweep = now
-	if e.gateNags == nil {
-		e.gateNags = map[string]*gateNag{}
-	}
 
 	gates, err := e.Store.OpenGates()
 	if err != nil {
 		return
 	}
-	live := map[string]bool{}
+	nags, err := e.Store.GateNags()
+	if err != nil {
+		return
+	}
 	for _, g := range gates {
-		live[g.ID] = true
-		n := e.gateNags[g.ID]
-		if n == nil {
-			n = &gateNag{}
-			e.gateNags[g.ID] = n
+		n, known := nags[g.ID]
+		if !known {
+			// First sight of this gate in this table — either it just opened
+			// (its opening ping already went out) or the daemon restarted and
+			// the record predates the table. Either way: record the moment and
+			// say nothing. Not knowing is not a reason to ping, and a restart
+			// must never re-nag every open gate, which it did twice today.
+			n = &store.GateNag{GateID: g.ID, LastTry: now, Tries: 1, Escalated: now.Sub(g.CreatedAt) > gateEscalateAfter}
+			e.Store.SaveGateNag(n)
+			continue
 		}
+		before := *n
 		switch {
 		case g.RunID == "":
 			// Engine-level (watcher) gates are informational: never redelivered,
 			// never nagged. They live in the UI's infra strip and in
 			// `krakoactl gates`, which is exactly where noise belongs.
-		case now.Sub(g.CreatedAt) > gateEscalateAfter && n.tries == 0 && undelivered(g):
-			// Older than the escalation window and never retried in this
-			// process: a day-late ping helps nobody, the escalation below does.
-			n.tries = 1
+		case now.Sub(g.CreatedAt) > gateEscalateAfter && undelivered(g) && n.Tries == 0:
+			// Older than the escalation window: a day-late delivery retry helps
+			// nobody, the escalation below does.
+			n.Tries = 1
 		case undelivered(g):
 			// Backoff on retries so a niffty outage doesn't become its own
 			// flood: 10m, 20m, 40m… capped by the sweep cadence.
-			if !n.lastTry.IsZero() && now.Sub(n.lastTry) < deliverySweepEvery*time.Duration(1<<min(n.tries, 4)) {
+			if !n.LastTry.IsZero() && now.Sub(n.LastTry) < deliverySweepEvery*time.Duration(1<<min(n.Tries, 4)) {
 				continue
 			}
-			n.lastTry, n.tries = now, n.tries+1
-			e.event(g.RunID, g.State, "gate-delivery-retry", map[string]any{"gate": g.ID, "attempt": n.tries}, g.Workspace)
+			n.LastTry, n.Tries = now, n.Tries+1
+			e.event(g.RunID, g.State, "gate-delivery-retry", map[string]any{"gate": g.ID, "attempt": n.Tries}, g.Workspace)
 			e.deliverLocked(g)
-		case g.RunID == "":
-			// engine-level (watcher) gates are informational: never nag
-		case now.Sub(g.CreatedAt) > gateEscalateAfter && !n.escalat:
-			n.escalat = true
+		case now.Sub(g.CreatedAt) > gateEscalateAfter && !n.Escalated:
+			n.Escalated = true
+			n.LastTry = now
 			e.notifyLocked(&core.Notice{
 				ID: "escalate-" + g.ID, Workspace: g.Workspace, RunID: g.RunID, State: g.State,
 				Kind: core.NoticeStuck, Text: escalationText(g, now),
 			})
-		case now.Sub(g.CreatedAt) > gateNagAfter && now.Sub(n.lastTry) > gateNagAfter && inWorkHours(now):
-			n.lastTry = now
+		case now.Sub(g.CreatedAt) > gateNagAfter && now.Sub(n.LastTry) > gateNagAfter && inWorkHours(now):
+			n.LastTry = now
 			e.notifyLocked(&core.Notice{
 				ID: fmt.Sprintf("nag-%s-%d", g.ID, now.Unix()), Workspace: g.Workspace, RunID: g.RunID, State: g.State,
 				Kind: core.NoticeStuck,
 				Text: fmt.Sprintf("still waiting on you: %s (%s, open %s)", g.Payload, g.ID, since(g.CreatedAt, now)),
 			})
 		}
-	}
-	for id := range e.gateNags {
-		if !live[id] {
-			delete(e.gateNags, id)
+		if *n != before {
+			if err := e.Store.SaveGateNag(n); err != nil {
+				e.Log.Printf("save gate nag %s: %v", g.ID, err)
+			}
 		}
+	}
+	if err := e.Store.PruneGateNags(); err != nil {
+		e.Log.Printf("prune gate nags: %v", err)
 	}
 }
 

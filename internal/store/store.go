@@ -109,6 +109,15 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 CREATE INDEX IF NOT EXISTS signals_pending ON signals(run_id, consumed);
 
+-- per-gate redelivery/nagging bookkeeping. In memory this was lost on every
+-- restart, so each restart re-nagged and re-escalated every open gate.
+CREATE TABLE IF NOT EXISTS gate_nags (
+  gate_id   TEXT PRIMARY KEY,
+  last_try  TEXT NOT NULL DEFAULT '',
+  tries     INTEGER NOT NULL DEFAULT 0,
+  escalated INTEGER NOT NULL DEFAULT 0
+);
+
 -- contact bindings per effective thread key (run id until the thread
 -- template stamps, migrated to the thread key after)
 CREATE TABLE IF NOT EXISTS thread_refs (
@@ -690,6 +699,53 @@ func (s *Store) DisarmRunTimers(runID string) error {
 // Reschedule moves a recurring timer to its next firing.
 func (s *Store) Reschedule(id int64, next time.Time) error {
 	_, err := s.db.Exec(`UPDATE timers SET fire_at=? WHERE id=?`, ts(next), id)
+	return err
+}
+
+// --- gate nagging ---
+
+// GateNag is how far the delivery sweep has gone with one gate.
+type GateNag struct {
+	GateID    string
+	LastTry   time.Time
+	Tries     int
+	Escalated bool
+}
+
+func (s *Store) GateNags() (map[string]*GateNag, error) {
+	rows, err := s.db.Query(`SELECT gate_id, last_try, tries, escalated FROM gate_nags`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]*GateNag{}
+	for rows.Next() {
+		var n GateNag
+		var last string
+		var esc int
+		if err := rows.Scan(&n.GateID, &last, &n.Tries, &esc); err != nil {
+			return nil, err
+		}
+		n.LastTry, n.Escalated = parseTS(last), esc == 1
+		out[n.GateID] = &n
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SaveGateNag(n *GateNag) error {
+	esc := 0
+	if n.Escalated {
+		esc = 1
+	}
+	_, err := s.db.Exec(`INSERT INTO gate_nags (gate_id, last_try, tries, escalated) VALUES (?,?,?,?)
+		ON CONFLICT(gate_id) DO UPDATE SET last_try=excluded.last_try, tries=excluded.tries, escalated=excluded.escalated`,
+		n.GateID, ts(n.LastTry), n.Tries, esc)
+	return err
+}
+
+// PruneGateNags drops bookkeeping for gates that are no longer open.
+func (s *Store) PruneGateNags() error {
+	_, err := s.db.Exec(`DELETE FROM gate_nags WHERE gate_id NOT IN (SELECT id FROM gates WHERE status='open')`)
 	return err
 }
 
