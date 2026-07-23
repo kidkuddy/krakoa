@@ -125,7 +125,35 @@ func cmdDoctor() error {
 		}
 	}
 
+	// Prefer the daemon's own verdicts: it probes on its launchd PATH, which is
+	// the PATH the runs actually use. A client shell without /opt/homebrew/bin
+	// reported four checks failed that were all fine — a false alarm is worse
+	// than no alarm, because it sends you fixing what is not broken.
+	live := map[string]struct {
+		ok     bool
+		detail string
+	}{}
+	if daemonUp {
+		var board []struct {
+			Workspace, Name, Detail string
+			OK, Probed              bool
+		}
+		if call("GET", "/v1/checks", nil, &board) == nil {
+			for _, r := range board {
+				if r.Probed {
+					live[r.Workspace+"/"+r.Name] = struct {
+						ok     bool
+						detail string
+					}{r.OK, r.Detail}
+				}
+			}
+		}
+	}
 	for _, c := range checks {
+		if v, ok := live[c.ws+"/"+c.dc.Name]; ok {
+			check(c.ws+": "+c.dc.Name, v.ok, v.detail+"  (as krakoad sees it)", c.dc.Fix)
+			continue
+		}
 		ok, detail := workspace.RunCheck(c.dc)
 		check(c.ws+": "+c.dc.Name, ok, detail, c.dc.Fix)
 	}

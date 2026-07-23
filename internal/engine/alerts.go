@@ -76,6 +76,42 @@ func alertText(ev EmittedEvent) string {
 	return b.String()
 }
 
+// closeStaleAlertsLocked retires alert gates whose condition a sweep no longer
+// reports. Without this a transient truth is a permanent interruption: an MR
+// flagged as orphaned 34 seconds after it was opened stayed on the page long
+// after its ticket link landed.
+//
+// ponytail: assumes the sweeping watcher is the only source of this
+// workspace's alerts, which holds while one command watcher emits all of them.
+// Give a second watcher its own alert events and this needs scoping per
+// watcher.
+func (e *Engine) closeStaleAlertsLocked(wsName string, events []EmittedEvent) {
+	ws := e.Workspaces[wsName]
+	if ws == nil || len(ws.Alerts) == 0 {
+		return
+	}
+	live := map[string]bool{}
+	for _, ev := range events {
+		key := ev.Key
+		if key == "" {
+			key = ev.Event
+		}
+		live[alertStatePrefix+ev.Event+":"+key] = true
+	}
+	for _, g := range e.Store.MustOpenGates() {
+		if g.RunID != "" || g.Workspace != wsName || !strings.HasPrefix(g.State, alertStatePrefix) {
+			continue
+		}
+		if live[g.State] {
+			continue
+		}
+		e.Store.CancelGate(g.ID, e.Clock.Now())
+		// forget the ack too, so a genuine recurrence can speak up again
+		e.Store.ClearDedupe(alertAckWatcher, g.State)
+		e.event("", g.State, "alert-cleared", map[string]any{"gate": g.ID}, wsName)
+	}
+}
+
 // ackAlertLocked silences one alert key permanently.
 func (e *Engine) ackAlertLocked(g *core.Gate) {
 	e.Store.DedupeMark(alertAckWatcher, g.State, e.Clock.Now())

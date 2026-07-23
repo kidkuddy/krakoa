@@ -115,10 +115,10 @@ func (n *Niffty) Notify(no *core.Notice) error {
 // structurally.
 func gateText(g *core.Gate, canvas string) string {
 	if canvas != "" {
-		return fmt.Sprintf("⏸ YOUR TURN — questions on %s. Fill the ANSWER blocks in the canvas, then reply done (or run: krakoactl harvest %s)\n%s", g.RunID, g.ID, canvas)
+		return fmt.Sprintf("questions on %s — fill the ANSWER blocks in the canvas, then reply done (or run: krakoactl harvest %s)\n%s", g.RunID, g.ID, canvas)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "⏸ YOUR TURN — [krakoa gate %s] %s", g.ID, g.Payload)
+	fmt.Fprintf(&b, "%s\n[%s]", g.Payload, g.ID)
 	for i, q := range g.Questions {
 		fmt.Fprintf(&b, "\n%d. %s", i+1, q)
 	}
