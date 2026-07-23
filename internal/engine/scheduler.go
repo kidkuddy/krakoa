@@ -764,7 +764,7 @@ func (e *Engine) HandleWatcherEvents(wsName, watcherName string, events []Emitte
 		}
 		disposition := e.routeEventLocked(wsName, ev)
 		if disposition == "no matching run" && spawnEvent {
-			run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+watcherName)
+			run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+watcherName, ev.Key)
 			if err != nil {
 				e.Log.Printf("watcher %s spawn: %v", watcherName, err)
 				continue
@@ -772,6 +772,9 @@ func (e *Engine) HandleWatcherEvents(wsName, watcherName string, events []Emitte
 			disposition = "spawned " + run.ID
 		}
 		e.event("", "watcher:"+watcherName, "watcher-observed", map[string]any{"event": ev.Event, "key": ev.Key, "disposition": disposition}, wsName)
+		if disposition == "no matching run" {
+			e.raiseAlertLocked(wsName, ev)
+		}
 		if spawnEvent && ev.Key != "" && disposition != "no matching run" && disposition != "run finished; dropped" {
 			e.Store.DedupeMark(watcherName, ev.Key, e.Clock.Now())
 		}

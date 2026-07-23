@@ -126,9 +126,13 @@ type WorkflowDefinition struct {
 	// soon as it resolves; runs sharing a thread key group together.
 	Thread string `yaml:"thread,omitempty"`
 	// Requires names workspace checks that must pass at admission.
-	Requires []string         `yaml:"requires,omitempty"`
-	Start    string           `yaml:"start"`
-	States   map[string]State `yaml:"states"`
+	Requires []string `yaml:"requires,omitempty"`
+	// Unique is a template identifying the work a run does. Two active runs may
+	// not share one — a manual review and a watcher-spawned review of the same
+	// MR at the same head are the same job done twice.
+	Unique string           `yaml:"unique,omitempty"`
+	Start  string           `yaml:"start"`
+	States map[string]State `yaml:"states"`
 }
 
 // AgentSpec is a named agent description, referenced by workflow states.

@@ -809,3 +809,18 @@ func repeat(s string, n int) string {
 	}
 	return out
 }
+
+// MustOpenGates is OpenGates for callers that treat a query failure as "none".
+func (s *Store) MustOpenGates() []*core.Gate {
+	gates, err := s.OpenGates()
+	if err != nil {
+		return nil
+	}
+	return gates
+}
+
+// ClearDedupe forgets one watcher observation so it can be acted on again.
+func (s *Store) ClearDedupe(watcher, key string) error {
+	_, err := s.db.Exec(`DELETE FROM watch_dedupe WHERE watcher=? AND key=?`, watcher, key)
+	return err
+}

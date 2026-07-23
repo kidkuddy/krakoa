@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/kidkuddy/krakoa/internal/core"
@@ -248,6 +249,22 @@ func (e *Engine) CancelRun(runID, reason string) error {
 		e.Store.CancelGate(g.ID, e.Clock.Now())
 	}
 	e.Store.DisarmRunTimers(runID)
+	// Kill the step that is mid-flight; a cancelled run whose agent keeps
+	// running still flips MRs and comments on tickets.
+	if cancel := e.stepCancels[runID]; cancel != nil {
+		cancel()
+		delete(e.stepCancels, runID)
+	}
+	// Release the watcher dedupe mark this run was spawned under, or that
+	// observation can never be acted on again (a cancelled review retired its
+	// MR head from the pipeline permanently).
+	if key, _ := run.Context["spawn_key"].(string); key != "" {
+		if watcher := strings.TrimPrefix(run.Parent, watcherStatePrefix); watcher != "" {
+			if err := e.Store.ClearDedupe(watcher, key); err != nil {
+				e.Log.Printf("clear dedupe %s/%s: %v", watcher, key, err)
+			}
+		}
+	}
 	run.Status = core.StatusCanceled
 	run.UpdatedAt = e.Clock.Now()
 	if err := e.Store.SaveRun(run); err != nil {

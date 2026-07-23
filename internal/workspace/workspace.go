@@ -24,6 +24,9 @@ type Meta struct {
 	// through `requires:`, krakoactl doctor runs the same registry, and the
 	// engine re-probes them to unblock runs — one definition, three consumers.
 	Checks map[string]DoctorCheck `yaml:"checks,omitempty"`
+	// Alerts names events that must never be silently dropped: one with no
+	// consumer raises a gate instead of vanishing into the log.
+	Alerts []string `yaml:"alerts,omitempty"`
 	// Envs maps an environment name (dev|staging|prod) to its facts — the
 	// trunk branch it deploys from, the namespace suffix it rolls into.
 	// Every task is bound to one; the workflow reads them as $env.<field>.
@@ -65,6 +68,7 @@ type Workspace struct {
 	// Doctor is Checks in name order — the list form krakoactl doctor reads.
 	Doctor []DoctorCheck
 
+	Alerts    []string
 	Envs      map[string]map[string]string
 	Repos     map[string]string
 	Workflows map[string]*core.WorkflowDefinition
@@ -100,6 +104,7 @@ func Load(path string) (*Workspace, []error) {
 	ws.GitVersion = gitVersion(path)
 	ws.Repos = meta.Repos
 	ws.Envs = meta.Envs
+	ws.Alerts = meta.Alerts
 	ws.Checks = map[string]DoctorCheck{}
 	for _, name := range sortedKeys(meta.Checks) {
 		dc := meta.Checks[name]

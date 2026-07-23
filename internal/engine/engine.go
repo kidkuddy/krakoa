@@ -61,6 +61,11 @@ type Engine struct {
 	// lastStallSweep throttles the buffered-signal stall guard.
 	lastStallSweep time.Time
 
+	// stepCancels holds the in-flight agent step's cancel func per run, so
+	// cancelling a run actually stops the process instead of leaving an orphan
+	// that keeps mutating GitLab after the run is gone.
+	stepCancels map[string]context.CancelFunc
+
 	// checks is the live verdict per "ws/check" — the board `krakoactl
 	// checks` prints and the gate `requires` consults. Probing happens off
 	// the lock; only the verdict is stored here.
@@ -123,6 +128,7 @@ func New(st *store.Store, rn runner.Runner, clk Clock, wss map[string]*workspace
 		Spawn:         func(f func()) { go f() },
 		watcherHealth: map[string]*watcherState{},
 		checks:        map[string]*checkResult{},
+		stepCancels:   map[string]context.CancelFunc{},
 		Exec:          realExec,
 		Log:           log.New(os.Stdout, "", log.LstdFlags),
 	}
@@ -208,7 +214,10 @@ func (e *Engine) StartRun(wsName, wfName string, inputs map[string]any, parent s
 	return run, err
 }
 
-func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, parent string) (*core.Run, error) {
+// spawnKey, when set, records the watcher observation that produced this run —
+// cancelling it then releases that dedupe mark instead of retiring the
+// observation forever.
+func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, parent string, spawnKey ...string) (*core.Run, error) {
 	ws, def, err := e.def(wsName, wfName)
 	if err != nil {
 		return nil, err
@@ -252,6 +261,16 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 		}
 		run.Context["env"] = env
 	}
+	if def.Unique != "" {
+		if key, err := core.Resolve(run, def.Unique); err == nil {
+			if holder := e.activeHolderLocked(run.Workspace, run.Workflow, def.Unique, fmt.Sprintf("%v", key)); holder != "" {
+				return nil, fmt.Errorf("%s is already working %v (run %s)", wfName, key, holder)
+			}
+		}
+	}
+	if len(spawnKey) > 0 && spawnKey[0] != "" {
+		run.Context["spawn_key"] = spawnKey[0]
+	}
 	if err := e.Store.CreateRun(run); err != nil {
 		return nil, err
 	}
@@ -269,6 +288,23 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 	}
 	e.admitLocked(def, run)
 	return run, nil
+}
+
+// activeHolderLocked names the active run already doing this exact work, if any.
+func (e *Engine) activeHolderLocked(wsName, wfName, tmpl, key string) string {
+	runs, err := e.Store.ListRuns(core.StatusRunning, core.StatusWaiting, core.StatusQueued, core.StatusGated, core.StatusBlocked, core.StatusNeedsAttention)
+	if err != nil {
+		return ""
+	}
+	for _, r := range runs {
+		if r.Workspace != wsName || r.Workflow != wfName {
+			continue
+		}
+		if v, err := core.Resolve(r, tmpl); err == nil && fmt.Sprintf("%v", v) == key {
+			return r.ID
+		}
+	}
+	return ""
 }
 
 // stampThreadLocked resolves the definition's thread template the moment it
@@ -580,6 +616,10 @@ func (e *Engine) answerGateLocked(gateID, response string, answers map[string]an
 		e.applyWatcherChoiceLocked(g, response)
 		return nil
 	}
+	if strings.HasPrefix(g.State, alertStatePrefix) {
+		e.ackAlertLocked(g)
+		return nil
+	}
 	if strings.HasPrefix(g.State, stallStatePrefix) {
 		e.resolveStallLocked(g, strings.TrimPrefix(g.State, stallStatePrefix), response)
 		return nil
@@ -686,7 +726,17 @@ func (e *Engine) startAgentStepLocked(def *core.WorkflowDefinition, run core.Run
 func (e *Engine) executeStep(def *core.WorkflowDefinition, runID string, st *core.StepExecution, req runner.Request, act core.ActionRunAgent) {
 	defer e.drain() // completion may queue the next agent step
 	st.HandoffDir = req.HandoffDir
-	res, err := e.Runner.Run(context.Background(), req)
+	ctx, cancel := context.WithCancel(context.Background())
+	e.mu.Lock()
+	e.stepCancels[runID] = cancel
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		delete(e.stepCancels, runID)
+		e.mu.Unlock()
+		cancel()
+	}()
+	res, err := e.Runner.Run(ctx, req)
 	if err != nil {
 		e.stepFailed(def, runID, st, act, fmt.Sprintf("runner: %v", err))
 		return
@@ -702,7 +752,7 @@ func (e *Engine) executeStep(def *core.WorkflowDefinition, runID string, st *cor
 		req.Resume = res.SessionID
 		req.ResumeMessage = "Your result.json was rejected: " + verr +
 			"\nWrite a corrected $KRAKOA_HANDOFF/result.json now."
-		res2, err2 := e.Runner.Run(context.Background(), req)
+		res2, err2 := e.Runner.Run(ctx, req)
 		if err2 != nil {
 			e.stepFailed(def, runID, st, act, fmt.Sprintf("runner (schema retry): %v", err2))
 			return
@@ -889,7 +939,7 @@ func (e *Engine) spawnFromEventLocked(wsName string, ev EmittedEvent) string {
 				return "duplicate (already handled by watcher " + n + ")"
 			}
 		}
-		run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+n)
+		run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+n, ev.Key)
 		if err != nil {
 			return "spawn failed: " + err.Error()
 		}
