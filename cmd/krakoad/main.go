@@ -110,6 +110,7 @@ func main() {
 		nf.Only = splitList(os.Getenv("KRAKOA_NIFFTY_WORKSPACES"))
 		nf.ThreadTS = func(runID string) string { return eng.ThreadRefForRun(runID, "slack_ts") }
 		nf.SaveRef = func(runID, kind, value string) { eng.Bind(runID, kind, value) }
+		nf.Log = log.Printf
 		eng.Channels = append(eng.Channels, nf)
 		if nf.Bin != "" {
 			board := &contact.NifftyBoard{

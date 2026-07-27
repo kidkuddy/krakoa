@@ -264,8 +264,8 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 		run.Context["env"] = env
 	}
 	if def.Unique != "" {
-		if key, err := core.Resolve(run, def.Unique); err == nil {
-			if holder := e.activeHolderLocked(run.Workspace, run.Workflow, def.Unique, fmt.Sprintf("%v", key)); holder != "" {
+		if key, ok := core.ResolveKey(run, def.Unique); ok {
+			if holder := e.activeHolderLocked(run.Workspace, run.Workflow, def.Unique, key); holder != "" {
 				return nil, fmt.Errorf("%s is already working %v (run %s)", wfName, key, holder)
 			}
 		}
@@ -302,7 +302,7 @@ func (e *Engine) activeHolderLocked(wsName, wfName, tmpl, key string) string {
 		if r.Workspace != wsName || r.Workflow != wfName {
 			continue
 		}
-		if v, err := core.Resolve(r, tmpl); err == nil && fmt.Sprintf("%v", v) == key {
+		if v, ok := core.ResolveKey(r, tmpl); ok && v == key {
 			return r.ID
 		}
 	}
@@ -316,13 +316,9 @@ func (e *Engine) stampThreadLocked(def *core.WorkflowDefinition, run *core.Run) 
 	if run.Thread != "" || def.Thread == "" {
 		return
 	}
-	v, err := core.Resolve(run, def.Thread)
-	if err != nil {
+	key, ok := core.ResolveKey(run, def.Thread)
+	if !ok {
 		return // not resolvable yet; try again after the next transition
-	}
-	key := fmt.Sprintf("%v", v)
-	if key == "" || key == "<nil>" {
-		return
 	}
 	run.Thread = key
 	if err := e.Store.SetRunThread(run.ID, key); err != nil {
