@@ -147,10 +147,39 @@ func Validate(def *WorkflowDefinition) []error {
 		fail("at least one terminal state is required")
 	}
 
-	// Reachability from start.
+	// Entries: each verb is another way in, so each is another reachability
+	// root. A followup's own entry state is unreachable from `start` by
+	// design — that is what makes it a separate verb.
+	var roots []string
 	if _, ok := def.States[def.Start]; ok {
-		seen := map[string]bool{def.Start: true}
-		frontier := []string{def.Start}
+		roots = append(roots, def.Start)
+	}
+	for _, entry := range def.EntryNames() {
+		e := def.Entries[entry]
+		if entry == "start" {
+			fail("entry %s: reserved name (the default entry is the workflow's own `start`)", entry)
+		}
+		if e.Start == "" {
+			fail("entry %s: start state is required", entry)
+		} else if _, ok := def.States[e.Start]; !ok {
+			fail("entry %s: start state %q does not exist", entry, e.Start)
+		} else {
+			roots = append(roots, e.Start)
+		}
+		for _, state := range sortedKeys(e.Seed) {
+			if _, ok := def.States[state]; !ok {
+				fail("entry %s: seed key %q is not a state (a seed stands in for a state that already ran)", entry, state)
+			}
+		}
+	}
+
+	// Reachability from every entry.
+	if len(roots) > 0 {
+		seen := map[string]bool{}
+		frontier := append([]string(nil), roots...)
+		for _, r := range roots {
+			seen[r] = true
+		}
 		for len(frontier) > 0 {
 			cur := frontier[len(frontier)-1]
 			frontier = frontier[:len(frontier)-1]
@@ -163,9 +192,18 @@ func Validate(def *WorkflowDefinition) []error {
 		}
 		for _, name := range names {
 			if !seen[name] {
-				fail("state %s: unreachable from start", name)
+				fail("state %s: unreachable from any entry", name)
 			}
 		}
 	}
 	return errs
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

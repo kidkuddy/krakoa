@@ -766,7 +766,7 @@ func (e *Engine) HandleWatcherEvents(wsName, watcherName string, events []Emitte
 		}
 		disposition := e.routeEventLocked(wsName, ev)
 		if disposition == "no matching run" && spawnEvent {
-			run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+watcherName, ev.Key)
+			run, err := e.startRunLocked(wsName, w.Workflow, "", ev.Payload, watcherStatePrefix+watcherName, ev.Key)
 			if err != nil {
 				e.Log.Printf("watcher %s spawn: %v", watcherName, err)
 				continue
@@ -960,7 +960,7 @@ func (e *Engine) fireSchedule(t *store.Timer) {
 		}
 	}
 
-	run, err := e.startRunLocked(wsName, wfName, nil, scheduleStatePrefix+wfName)
+	run, err := e.startRunLocked(wsName, wfName, "", nil, scheduleStatePrefix+wfName)
 	if err != nil {
 		e.Log.Printf("schedule %s/%s: %v", wsName, wfName, err)
 		e.event("", scheduleStatePrefix+wfName, "schedule-failed",

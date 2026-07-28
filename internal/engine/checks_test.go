@@ -23,7 +23,7 @@ func TestRequiresBlocksAndAutoResumes(t *testing.T) {
 
 	v.eng.recordCheck("demo", "cluster", false, "token expired")
 
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestEmptyStringDefaultIsApplied(t *testing.T) {
 	def.Inputs["note"] = core.InputSpec{Type: "string", Default: ""}
 
 	v.run.on("refining", ok("outcome", "ok", "ticket", "t"))
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

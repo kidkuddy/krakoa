@@ -218,13 +218,14 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		var body struct {
 			Workspace string         `json:"workspace"`
 			Workflow  string         `json:"workflow"`
+			Entry     string         `json:"entry"` // "" = the workflow's default entry
 			Inputs    map[string]any `json:"inputs"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			fail(w, 400, err)
 			return
 		}
-		run, err := eng.StartRun(body.Workspace, body.Workflow, body.Inputs, "")
+		run, err := eng.StartRun(body.Workspace, body.Workflow, body.Entry, body.Inputs, "")
 		if err != nil {
 			fail(w, 400, err)
 			return

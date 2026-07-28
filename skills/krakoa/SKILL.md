@@ -132,6 +132,33 @@ External signal into a waiting run:
   starting a run. Slack (niffty) pings the user when a gate opens.
 - After a run reaches `done`, offer `krakoactl why <run>` as the review.
 
+## Follow up on work that already shipped
+
+Trigger: the user tested a delivered task and wants a change, and the scope
+is unchanged — "almost, but the button should be on the left", "it works but
+gate it behind the flag". Same scope = **same ticket**, so this is a followup
+verb, not a new task:
+
+```bash
+krakoactl run task-lifecycle:followup --workspace callab \
+  --input ticket_id='<the ticket the original run filed>' \
+  --input feedback='<the user's words, verbatim>' \
+  --input repo='<only if the original named one>' \
+  --input env='<only if the original named one>'
+```
+
+It comments + reopens the ticket, the builder pushes a NEW MR on it, the
+sweeper reviews that MR, and this run merges, deploys and closes — the same
+back half as a normal lifecycle. It lands in the original's Slack thread.
+
+- Find the ticket with `krakoactl runs --thread <ticket>` or `krakoactl why
+  <original-run>` if the user names the run instead.
+- **Scope changed** (a different feature, a second repo) → that is a new
+  `krakoactl run task-lifecycle`, not a followup.
+- Never just comment on the ticket to retrigger the builder. That does start
+  a build, but no run is waiting to merge it: the MR gets reviewed and then
+  sits, and `mr-ready` surfaces as a stray alert gate.
+
 ## Slack agent mode (niffty-spawned sessions)
 
 When this session was spawned by niffty from a Slack DM (the spawn context

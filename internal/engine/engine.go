@@ -207,10 +207,11 @@ func (e *Engine) event(runID, state, kind string, data map[string]any, ws string
 
 // --- run lifecycle ---
 
-// StartRun validates inputs and admits (or FIFO-queues) a new run.
-func (e *Engine) StartRun(wsName, wfName string, inputs map[string]any, parent string) (*core.Run, error) {
+// StartRun validates inputs and admits (or FIFO-queues) a new run. entryName
+// is "" for the workflow's default entry, or the name of a declared verb.
+func (e *Engine) StartRun(wsName, wfName, entryName string, inputs map[string]any, parent string) (*core.Run, error) {
 	e.mu.Lock()
-	run, err := e.startRunLocked(wsName, wfName, inputs, parent)
+	run, err := e.startRunLocked(wsName, wfName, entryName, inputs, parent)
 	e.mu.Unlock()
 	e.drain()
 	return run, err
@@ -219,15 +220,19 @@ func (e *Engine) StartRun(wsName, wfName string, inputs map[string]any, parent s
 // spawnKey, when set, records the watcher observation that produced this run —
 // cancelling it then releases that dedupe mark instead of retiring the
 // observation forever.
-func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, parent string, spawnKey ...string) (*core.Run, error) {
+func (e *Engine) startRunLocked(wsName, wfName, entryName string, inputs map[string]any, parent string, spawnKey ...string) (*core.Run, error) {
 	ws, def, err := e.def(wsName, wfName)
+	if err != nil {
+		return nil, err
+	}
+	entry, err := def.EntryFor(entryName)
 	if err != nil {
 		return nil, err
 	}
 	if inputs == nil {
 		inputs = map[string]any{}
 	}
-	for name, spec := range def.Inputs {
+	for name, spec := range entry.Inputs {
 		if _, ok := inputs[name]; ok {
 			continue
 		}
@@ -244,7 +249,7 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 	run := &core.Run{
 		ID: newID(wfName), Workspace: wsName, Workflow: wfName,
 		DefHash: def.Hash, WSVersion: ws.GitVersion,
-		State: def.Start, Status: core.StatusQueued,
+		State: entry.Start, Status: core.StatusQueued,
 		Inputs: inputs, Context: map[string]any{}, EdgeCounts: map[string]int{},
 		Parent: parent, CreatedAt: now, UpdatedAt: now,
 	}
@@ -263,6 +268,20 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 		}
 		run.Context["env"] = env
 	}
+	// A verb's seed stands in for the states an earlier run already walked,
+	// so everything downstream ($filing.ticket_id, the thread key, the
+	// correlation on the mr-ready arm) resolves from the first step.
+	for state, fields := range entry.Seed {
+		seeded := make(map[string]any, len(fields))
+		for k, tmpl := range fields {
+			v, err := core.Resolve(run, tmpl)
+			if err != nil {
+				return nil, fmt.Errorf("entry %s: seed %s.%s: %w", entryName, state, k, err)
+			}
+			seeded[k] = v
+		}
+		run.Context[state] = seeded
+	}
 	if def.Unique != "" {
 		if key, ok := core.ResolveKey(run, def.Unique); ok {
 			if holder := e.activeHolderLocked(run.Workspace, run.Workflow, def.Unique, key); holder != "" {
@@ -276,7 +295,7 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 	if err := e.Store.CreateRun(run); err != nil {
 		return nil, err
 	}
-	e.event(run.ID, "", "run-created", map[string]any{"inputs": inputs, "def_hash": def.Hash}, wsName)
+	e.event(run.ID, "", "run-created", map[string]any{"inputs": inputs, "def_hash": def.Hash, "entry": entryName}, wsName)
 	e.stampThreadLocked(def, run)
 
 	active, err := e.Store.CountActive(wsName, wfName)
@@ -968,7 +987,7 @@ func (e *Engine) spawnFromEventLocked(wsName string, ev EmittedEvent) string {
 				return "duplicate (already handled by watcher " + n + ")"
 			}
 		}
-		run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+n, ev.Key)
+		run, err := e.startRunLocked(wsName, w.Workflow, "", ev.Payload, watcherStatePrefix+n, ev.Key)
 		if err != nil {
 			return "spawn failed: " + err.Error()
 		}

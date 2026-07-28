@@ -65,6 +65,14 @@ thread: "$filing.ticket_id"   # groups runs serving one piece of work; stamped w
 unique: "$input.mr_url"       # two ACTIVE runs may not share this key — dedupes manual vs watcher starts
 requires: [multica-auth, glab, niffty]   # workspace checks that must pass at admission
 start: refining
+entries:                      # named verbs beside the default `start` (optional)
+  followup:
+    start: following-up       # the state this verb begins in
+    inputs:                   # merged OVER the workflow's; redeclare to drop `required`
+      idea: {type: text}
+      ticket_id: {type: string, required: true}
+    seed:                     # state -> result, templated over $input
+      filing: {ticket_id: $input.ticket_id}
 states: {...}
 ```
 
@@ -73,11 +81,35 @@ concurrency slot and auto-resumes when the check passes again. Put a check on
 the *state* that needs it, not the workflow, when only one step needs it
 (`rollout-wait` needs the cluster; refining does not).
 
+### Entries (verbs)
+
+Start with none. Add one when the same piece of work needs re-entering
+partway down — a followup on a shipped ticket, an MR that arrived without a
+lifecycle run behind it. `krakoactl run <workflow>:<entry>`.
+
+A verb is only which state a run begins in, plus a `seed` standing in for
+states an earlier run already walked. Seeding `filing.ticket_id` is not a
+fiction: the ticket really was filed, by the run this one follows — which is
+why `thread:`, every `correlate:` and every later `$filing.ticket_id`
+resolves from the first step, unchanged.
+
+- **A verb is not a new workflow.** If the states below the entry differ, you
+  want a separate workflow. If they are identical, you want a verb — the back
+  half of a lifecycle is where the scar tissue lives and it must not be
+  copied.
+- **A verb is not a new scope.** Different work → the default entry. Same work,
+  one more pass → a verb.
+- Each entry is another reachability root, so a verb's own entry state is
+  legitimately unreachable from `start`. Dry-run walks every entry.
+- Seed keys must name real states; the validator rejects a typo instead of
+  seeding context nothing reads.
+
 ### States
 
 Every state carries at most one step and its transitions. Non-terminal states
-need ≥1 transition; every state must be reachable from `start`; ≥1 terminal
-state; state names `input`, `last`, `env` are reserved.
+need ≥1 transition; every state must be reachable from `start` or from a
+declared entry; ≥1 terminal state; state names `input`, `last`, `env` are
+reserved.
 
 **agent** — a Claude Code session doing work in the world.
 
@@ -269,7 +301,11 @@ agents — use it where binding the wrong agent is a real risk (code review).
 - **Timeouts are honest, not decorative.** A timeout arm that routes to a state
   claiming success is a lie in the thread; route it to a caveat or a gate.
 - Set `thread:` on anything with a natural work key, and `unique:` wherever the
-  same job can be started twice (manual + watcher).
+  same job can be started twice (manual + watcher, or a verb racing the run
+  it follows).
+- **Re-entry over duplication.** Work that needs another pass through states
+  you already wrote is an `entries:` verb. Copying the back half into a second
+  workflow is how the two drift.
 
 ## Checklist
 

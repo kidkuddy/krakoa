@@ -125,6 +125,49 @@ func TestValidate(t *testing.T) {
 			},
 			"unreachable",
 		},
+		{
+			// A verb's own entry state is unreachable from `start` by design;
+			// declaring the entry is what makes it reachable.
+			"entry makes its start state reachable",
+			func(d *WorkflowDefinition) {
+				d.States["island"] = State{Step: StepAgent, Agent: "x", On: map[string]string{"ok": "done"}}
+				d.Entries = map[string]Entry{"followup": {Start: "island"}}
+			},
+			"",
+		},
+		{
+			"entry with unknown start",
+			func(d *WorkflowDefinition) {
+				d.Entries = map[string]Entry{"followup": {Start: "zzz"}}
+			},
+			`entry followup: start state "zzz" does not exist`,
+		},
+		{
+			"entry without start",
+			func(d *WorkflowDefinition) {
+				d.Entries = map[string]Entry{"followup": {}}
+			},
+			"entry followup: start state is required",
+		},
+		{
+			"entry named start",
+			func(d *WorkflowDefinition) {
+				d.Entries = map[string]Entry{"start": {Start: "refining"}}
+			},
+			"reserved name",
+		},
+		{
+			// A seed stands in for a state that already ran; a key naming no
+			// state seeds a context nothing reads.
+			"seed key that is not a state",
+			func(d *WorkflowDefinition) {
+				d.Entries = map[string]Entry{"followup": {
+					Start: "refining",
+					Seed:  map[string]map[string]string{"filign": {"ticket_id": "$input.ticket_id"}},
+				}}
+			},
+			`seed key "filign" is not a state`,
+		},
 	}
 
 	for _, tc := range cases {

@@ -2,6 +2,11 @@
 // Zero I/O by design: everything here is table-testable.
 package core
 
+import (
+	"fmt"
+	"sort"
+)
+
 // StepKind is the closed set of work a state can carry.
 type StepKind string
 
@@ -130,9 +135,60 @@ type WorkflowDefinition struct {
 	// Unique is a template identifying the work a run does. Two active runs may
 	// not share one — a manual review and a watcher-spawned review of the same
 	// MR at the same head are the same job done twice.
-	Unique string           `yaml:"unique,omitempty"`
-	Start  string           `yaml:"start"`
-	States map[string]State `yaml:"states"`
+	Unique string `yaml:"unique,omitempty"`
+	Start  string `yaml:"start"`
+	// Entries are the named verbs into this workflow beside the default
+	// `start`. A followup is not a new piece of work — it re-enters the
+	// same lifecycle further down, carrying what the earlier run already
+	// established.
+	Entries map[string]Entry `yaml:"entries,omitempty"`
+	States  map[string]State `yaml:"states"`
+}
+
+// Entry is one named way into a workflow — a verb. It begins at its own
+// state and seeds the facts an earlier run established, so the states
+// downstream resolve their $refs exactly as they would mid-lifecycle.
+type Entry struct {
+	Start string `yaml:"start"`
+	// Inputs are merged over the workflow's own: an entry adds the inputs
+	// its verb needs, and redeclares any shared input whose `required` does
+	// not apply to it.
+	Inputs map[string]InputSpec `yaml:"inputs,omitempty"`
+	// Seed writes state-name -> result into the run's context at creation,
+	// each value a template over $input. Seeding `filing.ticket_id` is not
+	// a fiction: the ticket really was filed, by the run this one follows.
+	Seed map[string]map[string]string `yaml:"seed,omitempty"`
+}
+
+// EntryFor resolves an entry name ("" = the default) to the state a run
+// starts in and the input specs it must satisfy.
+func (d *WorkflowDefinition) EntryFor(name string) (Entry, error) {
+	if name == "" {
+		return Entry{Start: d.Start, Inputs: d.Inputs}, nil
+	}
+	e, ok := d.Entries[name]
+	if !ok {
+		return Entry{}, fmt.Errorf("workflow %s has no entry %q (declares %v)", d.Name, name, d.EntryNames())
+	}
+	merged := make(map[string]InputSpec, len(d.Inputs)+len(e.Inputs))
+	for k, v := range d.Inputs {
+		merged[k] = v
+	}
+	for k, v := range e.Inputs {
+		merged[k] = v
+	}
+	e.Inputs = merged
+	return e, nil
+}
+
+// EntryNames lists the declared verbs, sorted, for error messages.
+func (d *WorkflowDefinition) EntryNames() []string {
+	names := make([]string, 0, len(d.Entries))
+	for n := range d.Entries {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // AgentSpec is a named agent description, referenced by workflow states.
