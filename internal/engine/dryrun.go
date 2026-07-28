@@ -41,9 +41,14 @@ func DryRun(ws *workspace.Workspace, wfName string, out io.Writer) error {
 	sort.Strings(edges)
 	covered := map[string]bool{}
 
-	fmt.Fprintf(out, "happy path:\n")
-	if err := dryWalk(ws, def, nil, covered, out); err != nil {
-		return err
+	// Every verb is another way in, and states only a verb can reach are only
+	// walkable from it. The default entry first, then each named one.
+	entries := append([]string{""}, def.EntryNames()...)
+	for _, entry := range entries {
+		fmt.Fprintf(out, "happy path (%s):\n", entryLabel(entry))
+		if err := dryWalk(ws, def, entry, nil, covered, out); err != nil {
+			return fmt.Errorf("entry %s: %w", entryLabel(entry), err)
+		}
 	}
 
 	for _, edge := range edges {
@@ -51,16 +56,34 @@ func DryRun(ws *workspace.Workspace, wfName string, out io.Writer) error {
 			continue
 		}
 		parts := strings.SplitN(edge, "/", 2)
-		fmt.Fprintf(out, "forcing edge %s:\n", edge)
-		if err := dryWalk(ws, def, &target{state: parts[0], outcome: parts[1]}, covered, out); err != nil {
-			return fmt.Errorf("edge %s: %w", edge, err)
+		var lastErr error
+		for _, entry := range entries {
+			fmt.Fprintf(out, "forcing edge %s (%s):\n", edge, entryLabel(entry))
+			if err := dryWalk(ws, def, entry, &target{state: parts[0], outcome: parts[1]}, covered, out); err != nil {
+				lastErr = fmt.Errorf("entry %s: %w", entryLabel(entry), err)
+				continue
+			}
+			if covered[edge] {
+				break
+			}
 		}
 		if !covered[edge] {
-			return fmt.Errorf("edge %s is unwalkable: the steered simulation never traversed it", edge)
+			if lastErr != nil {
+				return fmt.Errorf("edge %s: %w", edge, lastErr)
+			}
+			return fmt.Errorf("edge %s is unwalkable from any entry: the steered simulation never traversed it", edge)
 		}
 	}
-	fmt.Fprintf(out, "dry-run OK: all %d transition edges walked\n", len(edges))
+	fmt.Fprintf(out, "dry-run OK: all %d transition edges walked across %d entr%s\n",
+		len(edges), len(entries), map[bool]string{true: "y", false: "ies"}[len(entries) == 1])
 	return nil
+}
+
+func entryLabel(entry string) string {
+	if entry == "" {
+		return "start"
+	}
+	return entry
 }
 
 // target steers one simulation: reach state, take outcome, then head home.
@@ -73,7 +96,7 @@ type target struct {
 // dryWalk runs one simulation. A run that ends done, failed, or parked is a
 // valid walk (parks exercise budgets and failure gates); only a stuck or
 // non-terminating sim is an error.
-func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target, covered map[string]bool, out io.Writer) error {
+func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, entryName string, tgt *target, covered map[string]bool, out io.Writer) error {
 	st, err := store.Open(":memory:")
 	if err != nil {
 		return err
@@ -106,7 +129,22 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 
 	clk := &settableClock{t: time.Now()}
 	fields := referencedFields(def)
-	rn := &synthRunner{def: def, choose: choose, record: record, fields: fields}
+	// forced carries the outcome the walker already chose for a state, for the
+	// probe that is about to synthesize it. Asking the chooser a second time
+	// there would consume the forced edge twice: the wait handler takes the
+	// target, and the probe — arriving after tgt.taken — falls back to the
+	// distance heuristic and fires a DIFFERENT outcome. Every state whose
+	// target outcome comes from a probe was unwalkable that way, on both probe
+	// kinds: command probes synthesize through Exec, agent probes through the
+	// synthetic runner.
+	forced := map[string]string{}
+	takeForced := func(state string) (string, bool) {
+		o, ok := forced[state]
+		delete(forced, state)
+		return o, ok
+	}
+
+	rn := &synthRunner{def: def, choose: choose, record: record, fields: fields, forced: takeForced}
 	eng := New(st, rn, clk, map[string]*workspace.Workspace{ws.Name: ws}, os.TempDir())
 	eng.Spawn = func(f func()) { f() }
 	eng.Log = log.New(io.Discard, "", 0)
@@ -114,7 +152,10 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 	// run — the synthetic exec picks the walk's outcome instead.
 	probeState := ""
 	eng.Exec = func(dir, command string) ([]byte, error) {
-		outcome := choose(probeState, def.States[probeState].On)
+		outcome, ok := takeForced(probeState)
+		if !ok {
+			outcome = choose(probeState, def.States[probeState].On)
+		}
 		record(probeState, outcome)
 		result := map[string]any{"outcome": outcome, "url": "dry-url", "status": "dry"}
 		for _, f := range fields[probeState] {
@@ -124,13 +165,17 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 		return raw, nil
 	}
 
+	entry, err := def.EntryFor(entryName)
+	if err != nil {
+		return err
+	}
 	inputs := map[string]any{}
-	for name, spec := range def.Inputs {
+	for name, spec := range entry.Inputs {
 		if spec.Default == "" {
 			inputs[name] = "dry-" + name
 		}
 	}
-	run, err := eng.StartRun(ws.Name, def.Name, inputs, "")
+	run, err := eng.StartRun(ws.Name, def.Name, entryName, inputs, "")
 	if err != nil {
 		return err
 	}
@@ -197,7 +242,7 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 			outcome := choose(cur.State, state.On)
 			if arm := armFor(state, outcome); arm == nil {
 				if p := firstProbe(state); p != nil && outcome != "timeout" {
-					probeState = cur.State
+					probeState, forced[cur.State] = cur.State, outcome
 					fmt.Fprintf(out, "  wait %s: firing probe\n", cur.State)
 					clk.Advance(p.Every.D() + time.Second)
 					eng.Tick()
@@ -217,8 +262,9 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, tgt *target,
 			} else {
 				record(cur.State, "timeout")
 				fmt.Fprintf(out, "  wait %s: firing timeout\n", cur.State)
-				// the state's own probe timer comes due in the same tick
-				probeState = cur.State
+				// the state's own probe timer comes due in the same tick; it
+				// must agree with the arm we are forcing, not race it
+				probeState, forced[cur.State] = cur.State, "timeout"
 				clk.Advance(maxTimeout(state) + time.Second)
 				eng.Tick()
 			}
@@ -241,11 +287,17 @@ type synthRunner struct {
 	choose func(state string, on map[string]string) string
 	record func(state, outcome string)
 	fields map[string][]string
+	// forced returns the outcome the walker already picked for this state
+	// (agent probes), so the chooser is not consulted — and consumed — twice.
+	forced func(state string) (string, bool)
 }
 
 func (r *synthRunner) Run(_ context.Context, req runner.Request) (*runner.Result, error) {
 	st := r.def.States[req.State]
-	outcome := r.choose(req.State, st.On)
+	outcome, ok := r.forced(req.State)
+	if !ok {
+		outcome = r.choose(req.State, st.On)
+	}
 	r.record(req.State, outcome)
 	result := map[string]any{"outcome": outcome}
 	for _, f := range r.fields[req.State] {

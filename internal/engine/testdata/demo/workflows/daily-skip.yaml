@@ -1,0 +1,19 @@
+name: daily-skip
+# Same schedule, but it parks on a wait — so the next slot arrives while the
+# previous run is still open. That is what skip_if_running is for.
+trigger: {kind: schedule, cron: "0 8,17 * * *", skip_if_running: true}
+concurrency: 1
+start: doing
+states:
+  doing:
+    step: agent
+    agent: notifier
+    instruction: do the daily thing
+    on: {ok: awaiting}
+  awaiting:
+    step: wait
+    arms:
+      - {event: acknowledged}
+      - {timeout: 24h}
+    on: {acknowledged: done, timeout: done}
+  done: {terminal: true}

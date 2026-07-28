@@ -6,7 +6,22 @@ inputs:
 concurrency: 3
 thread: "$filing.ticket_id"
 start: refining
+entries:
+  followup:
+    start: following-up
+    inputs:
+      idea: {type: text}
+      ticket_id: {type: string, required: true}
+      feedback: {type: text, required: true}
+    seed:
+      filing: {ticket_id: $input.ticket_id}
 states:
+  following-up:
+    step: agent
+    agent: tracker-operator
+    instruction: Comment the feedback, set the ticket in_progress.
+    in: {ticket_id: $input.ticket_id, feedback: $input.feedback}
+    on: {ok: building}
   refining:
     step: agent
     agent: refiner

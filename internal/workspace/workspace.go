@@ -27,6 +27,10 @@ type Meta struct {
 	// Alerts names events that must never be silently dropped: one with no
 	// consumer raises a gate instead of vanishing into the log.
 	Alerts []string `yaml:"alerts,omitempty"`
+	// Contact declares this workspace's human channels as workspace scripts
+	// (JSON in, JSON out — the probe contract). A chat tool is environment,
+	// so it lives here rather than in the engine.
+	Contact map[string]ContactChannel `yaml:"contact,omitempty"`
 	// Envs maps an environment name (dev|staging|prod) to its facts — the
 	// trunk branch it deploys from, the namespace suffix it rolls into.
 	// Every task is bound to one; the workflow reads them as $env.<field>.
@@ -49,6 +53,14 @@ type DoctorCheck struct {
 	Fix     string   `yaml:"fix,omitempty"`
 }
 
+// ContactChannel is one workspace-declared delivery channel. The script gets
+// the gate or notice as JSON on stdin and prints {"ok":true,"refs":{...}}.
+type ContactChannel struct {
+	Command string `yaml:"command"`
+	// Timeout bounds one delivery; empty uses the contact default.
+	Timeout core.Duration `yaml:"timeout,omitempty"`
+}
+
 // Gatekeeper restricts which agents may bind to states of a class.
 type Gatekeeper struct {
 	Class  string   `yaml:"class"`
@@ -69,6 +81,7 @@ type Workspace struct {
 	Doctor []DoctorCheck
 
 	Alerts    []string
+	Contact   map[string]ContactChannel
 	Envs      map[string]map[string]string
 	Repos     map[string]string
 	Workflows map[string]*core.WorkflowDefinition
@@ -105,6 +118,12 @@ func Load(path string) (*Workspace, []error) {
 	ws.Repos = meta.Repos
 	ws.Envs = meta.Envs
 	ws.Alerts = meta.Alerts
+	ws.Contact = meta.Contact
+	for _, name := range sortedKeys(meta.Contact) {
+		if err := checkScript(path, meta.Contact[name].Command); err != nil {
+			fail("workspace.yaml: contact %q: %v", name, err)
+		}
+	}
 	ws.Checks = map[string]DoctorCheck{}
 	for _, name := range sortedKeys(meta.Checks) {
 		dc := meta.Checks[name]

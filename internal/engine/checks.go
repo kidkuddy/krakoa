@@ -329,7 +329,7 @@ func (e *Engine) notifyLocked(n *core.Notice) {
 		n.At = e.Clock.Now()
 	}
 	e.event(n.RunID, n.State, "notice", map[string]any{"kind": string(n.Kind), "id": n.ID, "text": n.Text}, n.Workspace)
-	channels := e.Channels
+	channels := e.channelsFor(n.Workspace)
 	e.pending = append(e.pending, func() {
 		for _, ch := range channels {
 			if err := ch.Notify(n); err != nil {

@@ -25,6 +25,27 @@ type Channel interface {
 	Notify(n *core.Notice) error
 }
 
+// Scoped is implemented by channels that serve only some workspaces — work
+// pings Slack, personal work pings Matrix. A channel that does not implement
+// it serves every workspace (the console, which is the audit trail).
+type Scoped interface{ Serves(workspace string) bool }
+
+// scope is the workspace allowlist shared by scoped channels. Empty = all,
+// so an unconfigured channel keeps its old everywhere behaviour.
+type scope []string
+
+func (s scope) Serves(ws string) bool {
+	if len(s) == 0 {
+		return true
+	}
+	for _, w := range s {
+		if w == ws {
+			return true
+		}
+	}
+	return false
+}
+
 // Console writes gates to the daemon log. Always configured; the audit trail
 // itself is the events table, written by the engine.
 type Console struct{ W io.Writer }
@@ -54,12 +75,15 @@ type Niffty struct {
 	URL  string // e.g. http://127.0.0.1:7777
 	To   string // relay recipient email
 	Bin  string // niffty CLI (canvas create); empty = plain messages only
+	Only scope  // workspaces served; empty = all
 	HTTP *http.Client
 
 	// ThreadTS resolves a run's bound Slack thread (empty = top-level).
 	ThreadTS func(runID string) string
 	// SaveRef stores a contact ref on the run's thread (canvas permalinks).
 	SaveRef func(runID, kind, value string)
+	// Log records why a delivery had to fall back. Optional.
+	Log func(format string, v ...any)
 }
 
 func NewNiffty(url, to string) *Niffty {
@@ -67,6 +91,8 @@ func NewNiffty(url, to string) *Niffty {
 }
 
 func (n *Niffty) Name() string { return "niffty" }
+
+func (n *Niffty) Serves(ws string) bool { return n.Only.Serves(ws) }
 
 // event is what niffty's /tasks/{ts}/event accepts: the thread's agent
 // session renders it (one renderer, P9) and decides whether to act.
@@ -140,6 +166,20 @@ func (n *Niffty) post(runID string, ev event) error {
 	if n.ThreadTS != nil {
 		ts = n.ThreadTS(runID)
 	}
+	// Nothing bound this run to a thread, because no human started it — a
+	// ceremony fires on a schedule. Open one rather than posting a DM under no
+	// thread, which no session owns and no reply can reach. Only ever with a
+	// way to bind it back, or every event would open another.
+	if ts == "" && runID != "" && n.SaveRef != nil {
+		opened, err := n.openThread(runID)
+		switch {
+		case err != nil && n.Log != nil:
+			n.Log("niffty open thread for %s: %v (relaying raw)", runID, err)
+		case err == nil:
+			n.SaveRef(runID, "slack_ts", opened)
+			ts = opened
+		}
+	}
 	if ts != "" {
 		err := n.postJSON("/tasks/"+ts+"/event", ev)
 		if err == nil {
@@ -162,7 +202,35 @@ func (n *Niffty) post(runID string, ev event) error {
 // fact, not a delivery failure.
 var errNoSession = errors.New("no session for thread")
 
+// openThread asks niffty to start a task the owner never messaged for: a fresh
+// top-level DM becomes the thread root and a session is registered against it,
+// so what follows lands as a reply that can be answered in place.
+func (n *Niffty) openThread(runID string) (string, error) {
+	body := map[string]string{
+		"to":     n.To,
+		"text":   "krakoa " + runID + " needs you — details in this thread.",
+		"run_id": runID,
+	}
+	var out struct {
+		OK       bool   `json:"ok"`
+		ThreadTS string `json:"thread_ts"`
+		Error    string `json:"error"`
+	}
+	if err := n.postJSONInto("/tasks", body, &out); err != nil {
+		return "", err
+	}
+	if !out.OK || out.ThreadTS == "" {
+		return "", fmt.Errorf("niffty /tasks: no thread opened: %s", out.Error)
+	}
+	return out.ThreadTS, nil
+}
+
 func (n *Niffty) postJSON(path string, v any) error {
+	return n.postJSONInto(path, v, nil)
+}
+
+// postJSONInto posts v and, when out is non-nil, decodes the response into it.
+func (n *Niffty) postJSONInto(path string, v, out any) error {
 	body, _ := json.Marshal(v)
 	resp, err := n.HTTP.Post(n.URL+path, "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -175,6 +243,12 @@ func (n *Niffty) postJSON(path string, v any) error {
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
 		return fmt.Errorf("niffty %s: %s: %s", path, resp.Status, b)
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(out); err != nil {
+		return fmt.Errorf("niffty %s: decode response: %w", path, err)
 	}
 	return nil
 }

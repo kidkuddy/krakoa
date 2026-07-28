@@ -46,6 +46,7 @@ watchers/*.yaml                 gates, events, timers)           watcher sweeps
 | Concept | What it is |
 |---|---|
 | **WorkflowDefinition** | YAML state machine. States carry one step: `agent`, `gate` (question/approval/choice), or `wait` (event / timer / probe arms — timeout arm mandatory). Transitions on outcomes; loop budgets per edge; per-workflow concurrency with FIFO queueing. Runs pin the definition hash. |
+| **Entry** | A named verb into a workflow beside its default `start` — another state to begin in, plus a `seed` standing in for the states an earlier run already walked. A followup is not new work: it re-enters the same lifecycle below the states that no longer apply, and everything downstream resolves its `$refs` unchanged. |
 | **AgentSpec** | Named agent: persona (becomes the agent's CLAUDE.md), skills carried, working folder, optional git-worktree isolation, model/effort knobs. |
 | **Skill** | Markdown instruction set (same shape as Claude Code skills), copied into the agent's home per step. Skills encode environment specifics — that's why the engine doesn't have to. |
 | **Watcher** | Scheduled probe emitting deduped events — an agent (judgment) or a workspace command script (pure observation). Two modes: spawn a run per observation, or resume waiting runs by correlation key. |
@@ -66,6 +67,7 @@ KRAKOA_WORKSPACES=path/to/workspace bin/krakoad
 
 # drive it
 krakoactl run my-workflow --workspace my-ws --input idea='fix the thing'
+krakoactl run my-workflow:followup --workspace my-ws --input ticket_id=X  # a declared verb
 krakoactl runs
 krakoactl gates
 krakoactl answer <gate-id> <response> [--answers k=v]
@@ -131,6 +133,8 @@ declared edge against a synthetic runner before anything touches the world.
 | `KRAKOA_DATA_DIR` | `~/.krakoa/data` | per-step agent homes + handoffs |
 | `KRAKOA_HTTP_ADDR` | `127.0.0.1:7770` | ingress (CLI, emits, UI) |
 | `KRAKOA_NIFFTY_URL` / `KRAKOA_NIFFTY_TO` | — | optional Slack relay channel |
+| `KRAKOA_MOMO_PROFILE` / `KRAKOA_MOMO_ROOM` | — | optional Matrix channel via the momo CLI (a thread per piece of work) |
+| `KRAKOA_{NIFFTY,MOMO,CHAN}_WORKSPACES` | all | comma-separated allowlist: which workspaces a channel carries |
 | `KRAKOA_CLAUDE_BIN` | auto-resolved | claude binary override |
 | `KRAKOA_ADDR` | `http://127.0.0.1:7770` | krakoactl → daemon |
 

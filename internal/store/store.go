@@ -335,6 +335,25 @@ func (s *Store) ThreadRef(thread, kind string) (string, error) {
 	return v, err
 }
 
+// ThreadRefs fetches every binding on a thread. Contact scripts get the whole
+// map: the engine must not know that "slack_ts" or "momo_root" mean anything.
+func (s *Store) ThreadRefs(thread string) (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT kind, value FROM thread_refs WHERE thread=?`, thread)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
+
 // RunsByThread returns a thread's runs, oldest first.
 func (s *Store) RunsByThread(thread string) ([]*core.Run, error) {
 	rows, err := s.db.Query(`SELECT `+runCols+` FROM runs WHERE thread=? ORDER BY created_at ASC`, thread)

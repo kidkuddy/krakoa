@@ -170,11 +170,14 @@ func cmdRun(args []string) error {
 	}
 	// the workflow is required — a silent default once started the wrong thing
 	if len(pos) != 1 || *ws == "" {
-		return fmt.Errorf("usage: run <workflow> --workspace <ws> [--input k=v] (flags may go anywhere; exactly one workflow name)")
+		return fmt.Errorf("usage: run <workflow>[:<entry>] --workspace <ws> [--input k=v] (flags may go anywhere; exactly one workflow name)")
 	}
+	// "task-lifecycle:followup" — the verb is which way into the workflow,
+	// not a different workflow, so it rides on the same name.
+	wf, entry, _ := strings.Cut(pos[0], ":")
 	var run map[string]any
 	if err := call("POST", "/v1/runs", map[string]any{
-		"workspace": *ws, "workflow": pos[0], "inputs": map[string]any(inputs),
+		"workspace": *ws, "workflow": wf, "entry": entry, "inputs": map[string]any(inputs),
 	}, &run); err != nil {
 		return err
 	}

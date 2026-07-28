@@ -166,7 +166,7 @@ func TestU1HappyPathWithRefineLoop(t *testing.T) {
 	fr.on("grounding", ok("outcome", "grounded"))
 	scriptHappyTail(fr)
 
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "fix the button"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "fix the button"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,11 +228,11 @@ func TestU1CorrelationIsolatesRuns(t *testing.T) {
 		v.run.on("filing", ok("outcome", "ok", "ticket_id", ticket))
 		v.run.on("dispatching", ok("outcome", "ok"))
 	}
-	r1, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "a"}, "")
+	r1, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "a"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "b"}, "")
+	r2, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "b"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestU1EventBuffersWhileMidState(t *testing.T) {
 	fr.on("grounding", ok("outcome", "grounded"))
 	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-4"))
 	fr.on("dispatching", ok("outcome", "ok"))
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "y"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "y"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestU1TimeoutToStalledGate(t *testing.T) {
 	fr.on("grounding", ok("outcome", "grounded"))
 	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-5"))
 	fr.on("dispatching", ok("outcome", "ok"))
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestU1AskBudgetExhaustionParks(t *testing.T) {
 		fr.on("refining", ok("outcome", "ok", "ticket", "d"))
 		fr.on("grounding", ok("outcome", "ungrounded", "questions", []any{"?"}))
 	}
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func TestSchemaViolationResumesOnceThenParks(t *testing.T) {
 	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
 	fr.on("grounding", ok("outcome", "grounded"))
 	scriptHappyTail(fr)
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +388,7 @@ func TestSchemaViolationResumesOnceThenParks(t *testing.T) {
 	// and a double violation parks
 	fr.on("refining", fakeStep{Result: map[string]any{"nope": true}})
 	fr.on("refining", fakeStep{Result: map[string]any{"still": "wrong"}})
-	run2, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "y"}, "")
+	run2, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "y"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +401,7 @@ func TestRunnerFailureParksAndRetryRecovers(t *testing.T) {
 	v := setup(t)
 	fr := v.run
 	fr.on("refining", fakeStep{Err: fmt.Errorf("api meltdown")})
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +508,7 @@ func TestRestartRecovery(t *testing.T) {
 	fr.on("grounding", ok("outcome", "grounded"))
 	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-7"))
 	fr.on("dispatching", ok("outcome", "ok"))
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +570,7 @@ func TestRestartRearmsTimers(t *testing.T) {
 	fr.on("grounding", ok("outcome", "grounded"))
 	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-10"))
 	fr.on("dispatching", ok("outcome", "ok"))
-	run, _ := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, _ := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 
 	ws, _ := workspace.Load("testdata/demo")
 	eng2 := New(v.st, newFakeRunner(), v.clock, map[string]*workspace.Workspace{"demo": ws}, t.TempDir())
@@ -767,7 +767,7 @@ func TestQuestionGateAnswersAccumulate(t *testing.T) {
 		fr.on("refining", ok("outcome", "ok", "ticket", "d"))
 		fr.on("grounding", ok("outcome", "ungrounded", "questions", []any{"q"}))
 	}
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,7 +797,7 @@ func TestCorrelationEventsRecurAcrossReviewRounds(t *testing.T) {
 	fr.on("grounding", ok("outcome", "grounded"))
 	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
 	fr.on("dispatching", ok("outcome", "ok"))
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,7 +832,7 @@ func TestBufferedSignalsDeduplicate(t *testing.T) {
 	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
 	var jobs []func()
 	v.eng.Spawn = func(f func()) { jobs = append(jobs, f) }
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +878,7 @@ func TestThreadStampingAndPropagation(t *testing.T) {
 	fr.on("grounding", ok("outcome", "grounded"))
 	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
 	fr.on("dispatching", ok("outcome", "ok"))
-	life, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, "")
+	life, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,7 +911,7 @@ func TestWorkingFolderFollowsRepoInput(t *testing.T) {
 	v := setup(t)
 	v.run.on("refining", ok("outcome", "ok", "ticket", "d"))
 	v.run.on("grounding", ok("outcome", "ungrounded", "questions", []any{"q"}))
-	if _, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "x"}, ""); err != nil {
+	if _, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, ""); err != nil {
 		t.Fatal(err)
 	}
 	var refine runner.Request
@@ -930,12 +930,12 @@ func TestWorkingFolderFollowsRepoInput(t *testing.T) {
 func TestQuestionsBoardAndBindings(t *testing.T) {
 	v := setup(t)
 	var board [][3]string
-	v.eng.Board = func(thread, title, lane string) { board = append(board, [3]string{thread, title, lane}) }
+	v.eng.Board = func(ws, thread, title, lane string) { board = append(board, [3]string{thread, title, lane}) }
 
 	fr := v.run
 	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
 	fr.on("grounding", ok("outcome", "ungrounded", "questions", []any{"which direction?", "pin it?"}))
-	run, err := v.eng.StartRun("demo", "task-lifecycle", map[string]any{"idea": "wizard task"}, "")
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "wizard task"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +31,18 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitList parses a comma-separated env var into a workspace allowlist.
+// Empty stays nil, which every scoped channel reads as "all workspaces".
+func splitList(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func main() {
@@ -94,8 +107,10 @@ func main() {
 	if nifftyTo != "" {
 		nf := contact.NewNiffty(nifftyURL, nifftyTo)
 		nf.Bin = os.Getenv("KRAKOA_NIFFTY_BIN")
+		nf.Only = splitList(os.Getenv("KRAKOA_NIFFTY_WORKSPACES"))
 		nf.ThreadTS = func(runID string) string { return eng.ThreadRefForRun(runID, "slack_ts") }
 		nf.SaveRef = func(runID, kind, value string) { eng.Bind(runID, kind, value) }
+		nf.Log = log.Printf
 		eng.Channels = append(eng.Channels, nf)
 		if nf.Bin != "" {
 			board := &contact.NifftyBoard{
@@ -107,11 +122,37 @@ func main() {
 				SaveRef: func(thread, kind, value string) { st.SetThreadRef(thread, kind, value) },
 				Log:     log.Printf,
 			}
-			eng.Board = board.Upsert
+			// The board is niffty's, so it carries only niffty's workspaces —
+			// without this the personal inbox thread lands on the work list,
+			// which is exactly what happened the first time this ran.
+			eng.Board = func(ws, thread, title, lane string) {
+				if !nf.Serves(ws) {
+					return
+				}
+				board.Upsert(thread, title, lane)
+			}
 		}
 	}
 	if chanURL != "" {
-		eng.Channels = append(eng.Channels, contact.NewChan(chanURL, os.Getenv("KRAKOA_CHAN_START")))
+		cn := contact.NewChan(chanURL, os.Getenv("KRAKOA_CHAN_START"))
+		cn.Only = splitList(os.Getenv("KRAKOA_CHAN_WORKSPACES"))
+		eng.Channels = append(eng.Channels, cn)
+	}
+	// Workspace-declared channels. The engine learns nothing about the tool on
+	// the other end: it execs a script with JSON on stdin. Declaration is also
+	// the scope — a channel serves the workspace that declared it, so there is
+	// no routing to configure.
+	for _, ws := range workspaces {
+		for _, name := range sortedNames(ws.Contact) {
+			c := ws.Contact[name]
+			eng.Channels = append(eng.Channels, &contact.Script{
+				ChannelName: name, Workspace: ws.Name, Dir: ws.Path,
+				Command: c.Command, Timeout: c.Timeout.D(),
+				Refs:    func(runID string) map[string]string { return eng.ThreadRefsForRun(runID) },
+				SaveRef: func(runID, kind, value string) { eng.Bind(runID, kind, value) },
+			})
+			log.Printf("contact %s/%s -> %s", ws.Name, name, c.Command)
+		}
 	}
 
 	eng.Recover()
@@ -177,13 +218,14 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 		var body struct {
 			Workspace string         `json:"workspace"`
 			Workflow  string         `json:"workflow"`
+			Entry     string         `json:"entry"` // "" = the workflow's default entry
 			Inputs    map[string]any `json:"inputs"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			fail(w, 400, err)
 			return
 		}
-		run, err := eng.StartRun(body.Workspace, body.Workflow, body.Inputs, "")
+		run, err := eng.StartRun(body.Workspace, body.Workflow, body.Entry, body.Inputs, "")
 		if err != nil {
 			fail(w, 400, err)
 			return
@@ -340,4 +382,14 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 	})
 
 	return mux
+}
+
+// sortedNames keeps channel construction deterministic.
+func sortedNames[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

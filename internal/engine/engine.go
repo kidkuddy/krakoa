@@ -79,8 +79,10 @@ type Engine struct {
 	Exec func(dir, command string) ([]byte, error)
 
 	// Board, when set, projects each thread onto an external board:
-	// Upsert(threadKey, title, lane). Called outside the lock via drain.
-	Board func(thread, title, lane string)
+	// Upsert(workspace, threadKey, title, lane). Called outside the lock via
+	// drain. The workspace rides along because a board belongs to ONE of them:
+	// the personal inbox thread must never appear on the work Slack list.
+	Board func(ws, thread, title, lane string)
 
 	Log *log.Logger
 }
@@ -205,10 +207,11 @@ func (e *Engine) event(runID, state, kind string, data map[string]any, ws string
 
 // --- run lifecycle ---
 
-// StartRun validates inputs and admits (or FIFO-queues) a new run.
-func (e *Engine) StartRun(wsName, wfName string, inputs map[string]any, parent string) (*core.Run, error) {
+// StartRun validates inputs and admits (or FIFO-queues) a new run. entryName
+// is "" for the workflow's default entry, or the name of a declared verb.
+func (e *Engine) StartRun(wsName, wfName, entryName string, inputs map[string]any, parent string) (*core.Run, error) {
 	e.mu.Lock()
-	run, err := e.startRunLocked(wsName, wfName, inputs, parent)
+	run, err := e.startRunLocked(wsName, wfName, entryName, inputs, parent)
 	e.mu.Unlock()
 	e.drain()
 	return run, err
@@ -217,15 +220,19 @@ func (e *Engine) StartRun(wsName, wfName string, inputs map[string]any, parent s
 // spawnKey, when set, records the watcher observation that produced this run —
 // cancelling it then releases that dedupe mark instead of retiring the
 // observation forever.
-func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, parent string, spawnKey ...string) (*core.Run, error) {
+func (e *Engine) startRunLocked(wsName, wfName, entryName string, inputs map[string]any, parent string, spawnKey ...string) (*core.Run, error) {
 	ws, def, err := e.def(wsName, wfName)
+	if err != nil {
+		return nil, err
+	}
+	entry, err := def.EntryFor(entryName)
 	if err != nil {
 		return nil, err
 	}
 	if inputs == nil {
 		inputs = map[string]any{}
 	}
-	for name, spec := range def.Inputs {
+	for name, spec := range entry.Inputs {
 		if _, ok := inputs[name]; ok {
 			continue
 		}
@@ -242,7 +249,7 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 	run := &core.Run{
 		ID: newID(wfName), Workspace: wsName, Workflow: wfName,
 		DefHash: def.Hash, WSVersion: ws.GitVersion,
-		State: def.Start, Status: core.StatusQueued,
+		State: entry.Start, Status: core.StatusQueued,
 		Inputs: inputs, Context: map[string]any{}, EdgeCounts: map[string]int{},
 		Parent: parent, CreatedAt: now, UpdatedAt: now,
 	}
@@ -261,9 +268,23 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 		}
 		run.Context["env"] = env
 	}
+	// A verb's seed stands in for the states an earlier run already walked,
+	// so everything downstream ($filing.ticket_id, the thread key, the
+	// correlation on the mr-ready arm) resolves from the first step.
+	for state, fields := range entry.Seed {
+		seeded := make(map[string]any, len(fields))
+		for k, tmpl := range fields {
+			v, err := core.Resolve(run, tmpl)
+			if err != nil {
+				return nil, fmt.Errorf("entry %s: seed %s.%s: %w", entryName, state, k, err)
+			}
+			seeded[k] = v
+		}
+		run.Context[state] = seeded
+	}
 	if def.Unique != "" {
-		if key, err := core.Resolve(run, def.Unique); err == nil {
-			if holder := e.activeHolderLocked(run.Workspace, run.Workflow, def.Unique, fmt.Sprintf("%v", key)); holder != "" {
+		if key, ok := core.ResolveKey(run, def.Unique); ok {
+			if holder := e.activeHolderLocked(run.Workspace, run.Workflow, def.Unique, key); holder != "" {
 				return nil, fmt.Errorf("%s is already working %v (run %s)", wfName, key, holder)
 			}
 		}
@@ -274,7 +295,7 @@ func (e *Engine) startRunLocked(wsName, wfName string, inputs map[string]any, pa
 	if err := e.Store.CreateRun(run); err != nil {
 		return nil, err
 	}
-	e.event(run.ID, "", "run-created", map[string]any{"inputs": inputs, "def_hash": def.Hash}, wsName)
+	e.event(run.ID, "", "run-created", map[string]any{"inputs": inputs, "def_hash": def.Hash, "entry": entryName}, wsName)
 	e.stampThreadLocked(def, run)
 
 	active, err := e.Store.CountActive(wsName, wfName)
@@ -300,7 +321,7 @@ func (e *Engine) activeHolderLocked(wsName, wfName, tmpl, key string) string {
 		if r.Workspace != wsName || r.Workflow != wfName {
 			continue
 		}
-		if v, err := core.Resolve(r, tmpl); err == nil && fmt.Sprintf("%v", v) == key {
+		if v, ok := core.ResolveKey(r, tmpl); ok && v == key {
 			return r.ID
 		}
 	}
@@ -314,13 +335,9 @@ func (e *Engine) stampThreadLocked(def *core.WorkflowDefinition, run *core.Run) 
 	if run.Thread != "" || def.Thread == "" {
 		return
 	}
-	v, err := core.Resolve(run, def.Thread)
-	if err != nil {
+	key, ok := core.ResolveKey(run, def.Thread)
+	if !ok {
 		return // not resolvable yet; try again after the next transition
-	}
-	key := fmt.Sprintf("%v", v)
-	if key == "" || key == "<nil>" {
-		return
 	}
 	run.Thread = key
 	if err := e.Store.SetRunThread(run.ID, key); err != nil {
@@ -361,6 +378,17 @@ func (e *Engine) ThreadRefForRun(runID, kind string) string {
 	return v
 }
 
+// ThreadRefsForRun returns every contact binding on a run's thread. Contact
+// scripts receive the whole map; the engine never interprets a key.
+func (e *Engine) ThreadRefsForRun(runID string) map[string]string {
+	run, err := e.Store.GetRun(runID)
+	if err != nil {
+		return nil
+	}
+	refs, _ := e.Store.ThreadRefs(EffectiveThread(run))
+	return refs
+}
+
 // projectBoardLocked recomputes a thread's lane and queues the board upsert
 // (exec happens outside the lock). Lanes: open gate > queued > active >
 // all-terminal; "done" is the human's to set, the engine stops at
@@ -370,9 +398,15 @@ func (e *Engine) projectBoardLocked(run *core.Run) {
 		return
 	}
 	key := EffectiveThread(run)
-	runs, err := e.Store.RunsByThread(run.Thread)
-	if err != nil || len(runs) == 0 {
-		runs = []*core.Run{run}
+	// A run whose thread template has not resolved yet has an EMPTY thread
+	// key, and RunsByThread("") matches every other unstamped run — across
+	// workspaces. The personal inbox item went onto the board carrying a
+	// callab ticket's idea as its title. Only group by a real key.
+	runs := []*core.Run{run}
+	if run.Thread != "" {
+		if grouped, err := e.Store.RunsByThread(run.Thread); err == nil && len(grouped) > 0 {
+			runs = grouped
+		}
 	}
 	lane := "needs-testing"
 	gates, _ := e.Store.OpenGates()
@@ -410,8 +444,8 @@ func (e *Engine) projectBoardLocked(run *core.Run) {
 		}
 		title = key + " — " + idea
 	}
-	board := e.Board
-	e.pending = append(e.pending, func() { board(key, title, lane) })
+	board, wsName := e.Board, run.Workspace
+	e.pending = append(e.pending, func() { board(wsName, key, title, lane) })
 }
 
 func (e *Engine) admitLocked(def *core.WorkflowDefinition, run *core.Run) {
@@ -548,7 +582,7 @@ func (e *Engine) openGateLocked(run core.Run, act core.ActionOpenGate) {
 // 10s of I/O) and records the per-channel outcome when it lands. Failures are
 // retried by sweepDeliveries until the gate is delivered or answered.
 func (e *Engine) deliverLocked(g *core.Gate) {
-	channels := e.Channels
+	channels := e.channelsFor(g.Workspace)
 	e.pending = append(e.pending, func() {
 		delivery := map[string]string{}
 		for _, ch := range channels {
@@ -570,6 +604,20 @@ func (e *Engine) deliverLocked(g *core.Gate) {
 		}
 		e.mu.Unlock()
 	})
+}
+
+// channelsFor returns the channels serving one workspace: callab pings Slack,
+// personal pings Matrix, and the console — which declares no scope — carries
+// everything, so nothing is ever delivered nowhere.
+func (e *Engine) channelsFor(ws string) []contact.Channel {
+	out := make([]contact.Channel, 0, len(e.Channels))
+	for _, ch := range e.Channels {
+		if s, ok := ch.(contact.Scoped); ok && !s.Serves(ws) {
+			continue
+		}
+		out = append(out, ch)
+	}
+	return out
 }
 
 // parkLocked flips the run to needs-attention and raises the fixed gate.
@@ -939,7 +987,7 @@ func (e *Engine) spawnFromEventLocked(wsName string, ev EmittedEvent) string {
 				return "duplicate (already handled by watcher " + n + ")"
 			}
 		}
-		run, err := e.startRunLocked(wsName, w.Workflow, ev.Payload, watcherStatePrefix+n, ev.Key)
+		run, err := e.startRunLocked(wsName, w.Workflow, "", ev.Payload, watcherStatePrefix+n, ev.Key)
 		if err != nil {
 			return "spawn failed: " + err.Error()
 		}
