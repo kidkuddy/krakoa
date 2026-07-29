@@ -68,6 +68,7 @@ func cmdDoctor() error {
 		Name       string
 		Path       string
 		GitVersion string
+		Dirty      []string
 		LoadedAt   time.Time
 		Doctor     []workspace.DoctorCheck
 	}
@@ -96,10 +97,20 @@ func cmdDoctor() error {
 			// run is the case the deferral exists for. Until it lands, the
 			// runtime is serving something other than what is on disk, and
 			// nothing else in this output would say so.
-			detail := fmt.Sprintf("loaded by krakoad (working tree at git %s)", ws.GitVersion)
+			// Name the tree that was actually read. "at git <sha>" alone reads
+			// as though that commit were loaded; it never is — Load reads the
+			// working tree. An uncommitted line in workspace.yaml once left the
+			// daemon serving a config without it while validate and doctor both
+			// said OK, and the failure surfaced states later as a git ENOENT.
+			source := "git " + ws.GitVersion
+			if len(ws.Dirty) > 0 {
+				source = fmt.Sprintf("working tree, %d file(s) UNCOMMITTED vs git %s: %s",
+					len(ws.Dirty), ws.GitVersion, strings.Join(ws.Dirty, ", "))
+			}
+			detail := fmt.Sprintf("loaded by krakoad from %s", source)
 			if !ws.LoadedAt.IsZero() {
-				detail = fmt.Sprintf("loaded by krakoad %s (working tree at git %s)",
-					ws.LoadedAt.Format("Jan 2 15:04"), ws.GitVersion)
+				detail = fmt.Sprintf("loaded by krakoad %s from %s",
+					ws.LoadedAt.Format("Jan 2 15:04"), source)
 			}
 			if n := workspace.ChangedSince(ws.Path, ws.LoadedAt); n > 0 {
 				check("workspace "+ws.Name, false,

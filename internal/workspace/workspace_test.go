@@ -174,3 +174,56 @@ func TestRepoResolution(t *testing.T) {
 		t.Fatalf("error names neither the bad key nor the known ones: %v", err)
 	}
 }
+
+// The repos map is checked at use, but by then a run has been admitted and an
+// agent spent, and the failure arrives as `git worktree add: cannot change to
+// 'callab.ai/echo-js'` several states downstream. The one case knowable at load
+// is the default, so it is refused there.
+func TestUnknownRepoDefaultFailsValidation(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.CopyFS(dir, os.DirFS("testdata/valid")); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string) {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("workspace.yaml", "name: testws\nrepos:\n  acme/app: /clones/app\n")
+	write("workflows/wf.yaml", `name: wf
+trigger: {kind: manual}
+inputs:
+  repo: {type: string, default: acme/typo}
+start: done
+states:
+  done: {terminal: true}
+`)
+
+	_, errs := Load(dir)
+	if len(errs) == 0 {
+		t.Fatal("a repo default that is not in the repos map loaded cleanly")
+	}
+	joined := ""
+	for _, e := range errs {
+		joined += e.Error() + "\n"
+	}
+	if !strings.Contains(joined, "acme/typo") || !strings.Contains(joined, "acme/app") {
+		t.Fatalf("error names neither the bad default nor the known repos:\n%s", joined)
+	}
+
+	// The same workflow with a real key is fine.
+	write("workflows/wf.yaml", `name: wf
+trigger: {kind: manual}
+inputs:
+  repo: {type: string, default: acme/app}
+start: done
+states:
+  done: {terminal: true}
+`)
+	if _, errs := Load(dir); len(errs) != 0 {
+		t.Fatalf("a known repo default was refused: %v", errs)
+	}
+}

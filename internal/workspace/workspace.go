@@ -286,6 +286,18 @@ func (ws *Workspace) checkRefs(def *core.WorkflowDefinition) []error {
 		}
 	}
 
+	// A `repo` input whose default is not in the repos map launches every run
+	// of this workflow against a repo that cannot resolve. Unknown keys are
+	// caught at use now, but by then a run has been admitted, an agent spent,
+	// and the failure surfaces as a git ENOENT several states downstream.
+	// Catch the one case that is knowable here: the default.
+	if spec, ok := def.Inputs["repo"]; ok && spec.Default != "" && len(ws.Repos) > 0 {
+		if _, known := ws.Repos[spec.Default]; !known && !filepath.IsAbs(spec.Default) {
+			fail("input repo defaults to %q, which is not in the workspace repos map (known: %s)",
+				spec.Default, strings.Join(sortedKeys(ws.Repos), ", "))
+		}
+	}
+
 	names := make([]string, 0, len(def.States))
 	for n := range def.States {
 		names = append(names, n)
