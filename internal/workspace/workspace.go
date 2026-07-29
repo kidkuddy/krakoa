@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -76,7 +78,15 @@ type Workspace struct {
 	Description string
 	Path        string
 	GitVersion  string
-	Checks      map[string]DoctorCheck
+	// Dirty names the working-tree files that differ from GitVersion. Load
+	// reads the working tree, never the commit — so a non-empty Dirty means
+	// what was loaded is NOT what GitVersion names.
+	Dirty []string
+	// LoadedAt is when this copy was read off disk. krakoad holds its
+	// workspaces for its whole lifetime; doctor compares this against the
+	// files to tell you the daemon is serving a stale config.
+	LoadedAt time.Time
+	Checks   map[string]DoctorCheck
 	// Doctor is Checks in name order — the list form krakoactl doctor reads.
 	Doctor []DoctorCheck
 
@@ -114,7 +124,8 @@ func Load(path string) (*Workspace, []error) {
 	}
 	ws.Name = meta.Name
 	ws.Description = meta.Description
-	ws.GitVersion = gitVersion(path)
+	ws.GitVersion, ws.Dirty = gitState(path)
+	ws.LoadedAt = time.Now()
 	ws.Repos = meta.Repos
 	ws.Envs = meta.Envs
 	ws.Alerts = meta.Alerts
@@ -362,10 +373,69 @@ func checkScript(wsPath, command string) error {
 	return nil
 }
 
-func gitVersion(path string) string {
+// gitState reports the commit the workspace dir sits on and which files under
+// it differ from that commit. Both matter: Load reads the working tree, so the
+// commit alone is a claim about something nobody read.
+func gitState(path string) (string, []string) {
 	out, err := exec.Command("git", "-C", path, "rev-parse", "--short", "HEAD").Output()
 	if err != nil {
-		return ""
+		return "", nil
 	}
-	return strings.TrimSpace(string(out))
+	version := strings.TrimSpace(string(out))
+	st, err := exec.Command("git", "-C", path, "status", "--porcelain", "--", ".").Output()
+	if err != nil {
+		return version, nil
+	}
+	var dirty []string
+	// porcelain v1 is XY<space><path>; only the trailing newline may be cut —
+	// trimming the whole output eats the leading space of an unstaged entry
+	// and takes the first character of its path with it.
+	for _, line := range strings.Split(strings.TrimRight(string(st), "\n"), "\n") {
+		if len(line) > 3 {
+			dirty = append(dirty, line[3:])
+		}
+	}
+	return version, dirty
+}
+
+// ChangedSince counts files under a workspace dir modified after t — how both
+// the daemon and doctor tell "what is on disk" from "what was read off it".
+// mtime, not git: an uncommitted edit is the case that misleads, and a commit
+// sha cannot see it. ponytail: whole-tree walk, workspaces are small.
+func ChangedSince(path string, t time.Time) int {
+	if path == "" || t.IsZero() {
+		return 0
+	}
+	n := 0
+	filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && d.Name() == ".git" {
+			return fs.SkipDir
+		}
+		// Directories count too: a deleted workflow leaves no file to time,
+		// only its parent's mtime. Without this, removing a state machine
+		// stayed live until the next restart.
+		if fi, err := d.Info(); err == nil && fi.ModTime().After(t) {
+			n++
+		}
+		return nil
+	})
+	return n
+}
+
+// Repo resolves an agent working folder: a key of the repos: map, or an
+// absolute path used as-is. A key that misses is a configuration error and
+// says so — it is never handed on as a path, which is how "callab.ai/echo-js"
+// once reached `git worktree add` as a directory and failed as ENOENT.
+func (ws *Workspace) Repo(key string) (string, error) {
+	if path, ok := ws.Repos[key]; ok {
+		return path, nil
+	}
+	if filepath.IsAbs(key) {
+		return key, nil
+	}
+	return "", fmt.Errorf("unknown repo %q in workspace %s; known: %s",
+		key, ws.Name, strings.Join(sortedKeys(ws.Repos), ", "))
 }

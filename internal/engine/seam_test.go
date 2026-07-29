@@ -430,7 +430,7 @@ func TestU2WatcherSpawnsDedupesAndReviews(t *testing.T) {
 
 	obs := []EmittedEvent{{
 		Event: "mr-draft-pending", Key: "dash!7!sha1",
-		Payload: map[string]any{"repo": "dash", "mr_iid": "7", "head_sha": "sha1"},
+		Payload: map[string]any{"repo": "acme/demo-app", "mr_iid": "7", "head_sha": "sha1"},
 	}}
 	v.eng.HandleWatcherEvents("demo", "draft-mr-watch", obs)
 	runs, _ := v.st.ListRuns()
@@ -452,7 +452,7 @@ func TestU2WatcherSpawnsDedupesAndReviews(t *testing.T) {
 	fr.on("requesting-changes", ok("outcome", "ok"))
 	obs2 := []EmittedEvent{{
 		Event: "mr-draft-pending", Key: "dash!7!sha2",
-		Payload: map[string]any{"repo": "dash", "mr_iid": "7", "head_sha": "sha2"},
+		Payload: map[string]any{"repo": "acme/demo-app", "mr_iid": "7", "head_sha": "sha2"},
 	}}
 	v.eng.HandleWatcherEvents("demo", "draft-mr-watch", obs2)
 	if runs, _ = v.st.ListRuns(); len(runs) != 2 {
@@ -477,7 +477,7 @@ func TestConcurrencyFIFO(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		events = append(events, EmittedEvent{
 			Event: "mr-draft-pending", Key: fmt.Sprintf("dash!%d!s", i),
-			Payload: map[string]any{"repo": "dash", "mr_iid": fmt.Sprintf("%d", i), "head_sha": "s"},
+			Payload: map[string]any{"repo": "acme/demo-app", "mr_iid": fmt.Sprintf("%d", i), "head_sha": "s"},
 		})
 	}
 	// pause jobs so all three land before any review completes
@@ -542,7 +542,7 @@ func TestRestartMidAgentStepReattempts(t *testing.T) {
 	run := &core.Run{
 		ID: "task-lifecycle-dead", Workspace: "demo", Workflow: "task-lifecycle",
 		DefHash: "h", State: "refining", Status: core.StatusRunning,
-		Inputs: map[string]any{"idea": "x", "repo": "r"}, Context: map[string]any{}, EdgeCounts: map[string]int{},
+		Inputs: map[string]any{"idea": "x", "repo": "acme/demo-app"}, Context: map[string]any{}, EdgeCounts: map[string]int{},
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if err := v.st.CreateRun(run); err != nil {
@@ -592,7 +592,7 @@ func TestWatcherTimerFiresProbeAgent(t *testing.T) {
 		"outcome": "ok",
 		"events": []any{map[string]any{
 			"event": "mr-draft-pending", "key": "dash!9!s",
-			"payload": map[string]any{"repo": "dash", "mr_iid": "9", "head_sha": "s"},
+			"payload": map[string]any{"repo": "acme/demo-app", "mr_iid": "9", "head_sha": "s"},
 		}},
 	}})
 	fr.on("reviewing", ok("outcome", "noop"))
@@ -623,7 +623,7 @@ func TestEmitSpawnsWatcherModeRun(t *testing.T) {
 	v.run.on("reviewing", ok("outcome", "noop"))
 	out := v.eng.HandleEmit("demo", EmittedEvent{
 		Event: "mr-draft-pending", Key: "dash!42!s1",
-		Payload: map[string]any{"repo": "dash", "mr_iid": "42", "head_sha": "s1"},
+		Payload: map[string]any{"repo": "acme/demo-app", "mr_iid": "42", "head_sha": "s1"},
 	})
 	if len(out) < 7 || out[:7] != "spawned" {
 		t.Fatalf("manual emit should spawn: %q", out)
@@ -889,7 +889,7 @@ func TestThreadStampingAndPropagation(t *testing.T) {
 	fr.on("reviewing", ok("outcome", "noop"))
 	v.eng.HandleWatcherEvents("demo", "draft-mr-watch", []EmittedEvent{{
 		Event: "mr-draft-pending", Key: "dash!7!s1",
-		Payload: map[string]any{"repo": "dash", "mr_iid": "7", "head_sha": "s1", "ticket_id": "CAL-9"},
+		Payload: map[string]any{"repo": "acme/demo-app", "mr_iid": "7", "head_sha": "s1", "ticket_id": "CAL-9"},
 	}})
 	runs, _ := v.st.RunsByThread("CAL-9")
 	if len(runs) != 2 {
@@ -922,6 +922,24 @@ func TestWorkingFolderFollowsRepoInput(t *testing.T) {
 	}
 	if refine.Spec.WorkingFolder != "/tmp/demo-app-clone" {
 		t.Fatalf("working folder = %q (want repos-mapped path)", refine.Spec.WorkingFolder)
+	}
+}
+
+// A repo the workspace does not declare is rejected at submit time. It used
+// to be admitted, then handed to `git worktree add` as a directory: one
+// uncommitted config line became a parked run with an open gate and a git
+// ENOENT naming a path that never existed.
+func TestUnknownRepoRejectedAtAdmission(t *testing.T) {
+	v := setup(t)
+	_, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x", "repo": "acme/never-added"}, "")
+	if err == nil {
+		t.Fatal("unknown repo was admitted")
+	}
+	if !strings.Contains(err.Error(), "acme/never-added") || !strings.Contains(err.Error(), "acme/demo-app") {
+		t.Fatalf("error names neither the bad key nor the known ones: %v", err)
+	}
+	if len(v.run.calls) != 0 {
+		t.Fatalf("no step should have started, got %d", len(v.run.calls))
 	}
 }
 

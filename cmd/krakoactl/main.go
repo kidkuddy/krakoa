@@ -463,8 +463,20 @@ func cmdWorkspace(args []string) error {
 			}
 			return fmt.Errorf("%d validation error(s)", len(errs))
 		}
-		fmt.Printf("workspace %s OK: %d workflows, %d agents, %d watchers, %d skills (git %s)\n",
-			ws.Name, len(ws.Workflows), len(ws.Agents), len(ws.Watchers), len(ws.Skills), ws.GitVersion)
+		// Say what was validated. "(git a893150)" reads as "validated at that
+		// commit" — it is the commit the dir sits on, while what was read is
+		// the working tree. Once those differ the sha is actively misleading:
+		// green here, and krakoad serving something else.
+		where := "working tree, clean at git " + ws.GitVersion
+		if len(ws.Dirty) > 0 {
+			where = fmt.Sprintf("working tree, %d file(s) differ from git %s: %s",
+				len(ws.Dirty), ws.GitVersion, strings.Join(ws.Dirty, ", "))
+		}
+		fmt.Printf("workspace %s OK: %d workflows, %d agents, %d watchers, %d skills\n  validated: %s\n",
+			ws.Name, len(ws.Workflows), len(ws.Agents), len(ws.Watchers), len(ws.Skills), where)
+		if len(ws.Dirty) > 0 {
+			fmt.Println("  note: krakoad reloads this within ~10s, once no agent step is running")
+		}
 		return nil
 	case "dry-run":
 		if len(args) < 3 {

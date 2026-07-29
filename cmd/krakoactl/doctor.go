@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/kidkuddy/krakoa/internal/runner"
 	"github.com/kidkuddy/krakoa/internal/workspace"
@@ -67,6 +68,7 @@ func cmdDoctor() error {
 		Name       string
 		Path       string
 		GitVersion string
+		LoadedAt   time.Time
 		Doctor     []workspace.DoctorCheck
 	}
 	var daemonWS []wsInfo
@@ -89,7 +91,23 @@ func cmdDoctor() error {
 	}
 	if daemonUp {
 		for _, ws := range daemonWS {
-			check("workspace "+ws.Name, true, fmt.Sprintf("loaded by krakoad (git %s)", ws.GitVersion), "")
+			// krakoad re-reads its workspaces when their files move, but not
+			// while an agent step is running — an edit landing under a live
+			// run is the case the deferral exists for. Until it lands, the
+			// runtime is serving something other than what is on disk, and
+			// nothing else in this output would say so.
+			detail := fmt.Sprintf("loaded by krakoad (working tree at git %s)", ws.GitVersion)
+			if !ws.LoadedAt.IsZero() {
+				detail = fmt.Sprintf("loaded by krakoad %s (working tree at git %s)",
+					ws.LoadedAt.Format("Jan 2 15:04"), ws.GitVersion)
+			}
+			if n := workspace.ChangedSince(ws.Path, ws.LoadedAt); n > 0 {
+				check("workspace "+ws.Name, false,
+					fmt.Sprintf("%s — %d file(s) changed on disk since", detail, n),
+					"krakoad reloads within ~10s once no agent step is running; `krakoactl runs` shows what is holding it")
+			} else {
+				check("workspace "+ws.Name, true, detail, "")
+			}
 			for _, dc := range ws.Doctor {
 				checks = append(checks, struct {
 					ws string

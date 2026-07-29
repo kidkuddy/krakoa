@@ -155,3 +155,22 @@ func TestLoadRunsValidator(t *testing.T) {
 }
 
 var _ = core.StepAgent // keep the import if assertions above change
+
+// A repo key that misses the map is a configuration error, not a path. The
+// fall-through it replaces sent "callab.ai/echo-js" to git as a directory.
+func TestRepoResolution(t *testing.T) {
+	ws := &Workspace{Name: "demo", Repos: map[string]string{"acme/app": "/clones/app"}}
+	if got, err := ws.Repo("acme/app"); err != nil || got != "/clones/app" {
+		t.Fatalf("known key = %q, %v", got, err)
+	}
+	if got, err := ws.Repo("/literal/path"); err != nil || got != "/literal/path" {
+		t.Fatalf("absolute path = %q, %v", got, err)
+	}
+	_, err := ws.Repo("acme/missing")
+	if err == nil {
+		t.Fatal("unknown key resolved instead of failing")
+	}
+	if !strings.Contains(err.Error(), "acme/missing") || !strings.Contains(err.Error(), "acme/app") {
+		t.Fatalf("error names neither the bad key nor the known ones: %v", err)
+	}
+}
