@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -107,6 +108,11 @@ type event struct {
 	// Wake asks niffty to spend a turn: gate questions, done-and-deployed,
 	// and stuck steps only. Routine progress is posted, never woken on.
 	Wake bool `json:"wake"`
+	// Fix is the workspace's own remedy line for a failing check — the one
+	// thing that makes an alert actionable instead of merely alarming.
+	Fix string `json:"fix,omitempty"`
+	// Workspace routes runless events to that workspace's alert thread.
+	Workspace string `json:"-"`
 }
 
 // canvasThreshold is how long a rendered question block has to be before it is
@@ -137,13 +143,15 @@ func (n *Niffty) Deliver(g *core.Gate) error {
 		Options:   g.Options,
 		Questions: g.Questions,
 		Wake:      true,
+		Workspace: g.Workspace,
 	})
 }
 
 func (n *Niffty) Notify(no *core.Notice) error {
 	return n.post(no.RunID, event{
 		Kind: string(no.Kind), EventID: no.ID, RunID: no.RunID, Text: no.Text,
-		Wake: no.Kind == core.NoticeDone || no.Kind == core.NoticeStuck || no.Kind == core.NoticeBlocked,
+		Wake:      no.Kind == core.NoticeDone || no.Kind == core.NoticeStuck || no.Kind == core.NoticeBlocked,
+		Workspace: no.Workspace,
 	})
 }
 
@@ -187,6 +195,17 @@ func questionsLen(g *core.Gate) int {
 // thread bound, and falls back to a raw DM otherwise (or when niffty says
 // the session is gone).
 func (n *Niffty) post(runID string, ev event) error {
+	// Nothing with a run of its own: an unlinked MR, a watcher that has died
+	// three sweeps running, an expired multica session. Each of these used to
+	// open its own top-level DM — eleven of thirty-eight threads in one week
+	// held exactly one message. They share one rolling thread per workspace.
+	if runID == "" {
+		if err := n.postJSON("/alerts/"+alertPath(ev.Workspace)+"/event", ev); err == nil {
+			return nil
+		}
+		// niffty cannot host the thread; a raw DM still beats losing it.
+	}
+
 	ts := ""
 	if n.ThreadTS != nil {
 		ts = n.ThreadTS(runID)
@@ -337,4 +356,13 @@ func (b *NifftyBoard) Upsert(thread, title, lane string) {
 	if out, err := exec.Command(b.Bin, "list", "move", id, lane).CombinedOutput(); err != nil {
 		b.Log("board move %s -> %s: %v: %.200s", thread, lane, err, out)
 	}
+}
+
+// alertPath keeps a workspace name safe to put in a URL path.
+func alertPath(ws string) string {
+	ws = strings.TrimSpace(ws)
+	if ws == "" {
+		return "default"
+	}
+	return url.PathEscape(ws)
 }
