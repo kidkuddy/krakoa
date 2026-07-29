@@ -1012,8 +1012,48 @@ func (e *Engine) stepCompleted(def *core.WorkflowDefinition, runID string, st *c
 		e.event(runID, st.State, "step-result-stale", map[string]any{"step": st.ID}, def.Workspace)
 		return // manual intervention moved the run; don't double-advance
 	}
+	e.rebindInputsLocked(run, result)
 	d := core.Advance(def, *run, outcome, result)
 	e.applyLocked(def, d)
+}
+
+// rebindInputsLocked lets a step correct an input the run was launched with,
+// by returning `rebind: {name: value}`.
+//
+// A run told mid-flight to work a different repo could not be: `repo` is an
+// input, gate answers cannot reach it, and the value stayed at the workflow's
+// default. It filed a second ticket against the default repo, building a UI
+// another live run was already building. Only declared inputs may be rebound,
+// so a step cannot invent state, and every rebind is an event.
+func (e *Engine) rebindInputsLocked(run *core.Run, result map[string]any) {
+	rebind, ok := result["rebind"].(map[string]any)
+	if !ok || len(rebind) == 0 {
+		return
+	}
+	def, err := e.runDef(run)
+	if err != nil {
+		return
+	}
+	changed := map[string]any{}
+	for k, v := range rebind {
+		if _, declared := def.Inputs[k]; !declared {
+			e.event(run.ID, run.State, "rebind-rejected", map[string]any{"input": k, "reason": "not a declared input"}, run.Workspace)
+			continue
+		}
+		if cur, had := run.Inputs[k]; had && fmt.Sprint(cur) == fmt.Sprint(v) {
+			continue
+		}
+		run.Inputs[k] = v
+		changed[k] = v
+	}
+	if len(changed) == 0 {
+		return
+	}
+	if err := e.Store.SaveRun(run); err != nil {
+		e.Log.Printf("rebind inputs on %s: %v", run.ID, err)
+		return
+	}
+	e.event(run.ID, run.State, "inputs-rebound", changed, run.Workspace)
 }
 
 // stepFailed applies the retry knob, then parks as needs-attention.

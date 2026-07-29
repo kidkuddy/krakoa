@@ -161,3 +161,44 @@ func TestResumeWorksOnAGatedRun(t *testing.T) {
 }
 
 func writeFile(path string) error { return os.WriteFile(path, []byte("x"), 0o644) }
+
+// A run told mid-flight that it is working the wrong repo could not act on it:
+// `repo` is an input, gate answers cannot reach one, and the value stayed at
+// the workflow default. That filed a second ticket building a UI another live
+// run was already building.
+func TestStepCanRebindADeclaredInput(t *testing.T) {
+	v := setup(t)
+	fr := v.run
+	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
+	// The grounder reads the ticket and finds it is not about the repo the run
+	// was launched against.
+	fr.on("grounding", ok("outcome", "grounded", "rebind", map[string]any{"repo": "acme/other-app"}))
+	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
+	fr.on("dispatching", ok("outcome", "ok"))
+
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := v.mustRun(t, run.ID).Inputs["repo"]; got != "acme/other-app" {
+		t.Fatalf("repo = %v; the grounder's correction was ignored", got)
+	}
+}
+
+// A step may correct the run, not invent it: only declared inputs rebind.
+func TestRebindRejectsUndeclaredInputs(t *testing.T) {
+	v := setup(t)
+	fr := v.run
+	fr.on("refining", ok("outcome", "ok", "ticket", "d"))
+	fr.on("grounding", ok("outcome", "grounded", "rebind", map[string]any{"smuggled": "value"}))
+	fr.on("filing", ok("outcome", "ok", "ticket_id", "CAL-9"))
+	fr.on("dispatching", ok("outcome", "ok"))
+
+	run, err := v.eng.StartRun("demo", "task-lifecycle", "", map[string]any{"idea": "x"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := v.mustRun(t, run.ID).Inputs["smuggled"]; present {
+		t.Fatal("an undeclared input was written into the run")
+	}
+}

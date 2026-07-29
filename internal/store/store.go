@@ -246,9 +246,13 @@ func (s *Store) CreateRun(r *core.Run) error {
 	return err
 }
 
+// SaveRun persists everything that moves during a run. Inputs are included
+// because a step may correct one — a run told mid-flight that it is working the
+// wrong repo has to be able to act on that, and without this the correction was
+// written to memory and lost on the next read.
 func (s *Store) SaveRun(r *core.Run) error {
-	res, err := s.db.Exec(`UPDATE runs SET state=?, status=?, context=?, edge_counts=?, updated_at=? WHERE id=?`,
-		r.State, string(r.Status), jenc(r.Context), jenc(r.EdgeCounts), ts(r.UpdatedAt), r.ID)
+	res, err := s.db.Exec(`UPDATE runs SET state=?, status=?, inputs=?, context=?, edge_counts=?, updated_at=? WHERE id=?`,
+		r.State, string(r.Status), jenc(r.Inputs), jenc(r.Context), jenc(r.EdgeCounts), ts(r.UpdatedAt), r.ID)
 	if err != nil {
 		return err
 	}
