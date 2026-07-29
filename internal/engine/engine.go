@@ -629,8 +629,28 @@ func (e *Engine) applyLocked(def *core.WorkflowDefinition, d core.Decision) {
 
 func (e *Engine) finishLocked(def *core.WorkflowDefinition, run core.Run, act core.ActionFinish) {
 	e.Store.DisarmRunTimers(run.ID)
+	e.retireGatesLocked(run, "run terminal")
 	e.event(run.ID, act.State, "run-finished", map[string]any{"terminal": act.State}, run.Workspace)
 	e.admitNextLocked(def, run.Workspace, run.Workflow)
+}
+
+// retireGatesLocked closes every open gate belonging to a run that can no
+// longer act on the answer. A gate outlived its run six times in one week —
+// one opened two minutes before its run finished and then nagged for sixteen
+// hours about a decision that had already made itself. Only alert gates
+// (RunID "") had a retirement path; runs had none.
+func (e *Engine) retireGatesLocked(run core.Run, reason string) {
+	for _, g := range e.Store.MustOpenGates() {
+		if g.RunID != run.ID {
+			continue
+		}
+		e.Store.CancelGate(g.ID, e.Clock.Now())
+		e.event(run.ID, g.State, "gate-retired", map[string]any{"gate": g.ID, "reason": reason}, run.Workspace)
+	}
+	// PruneGateNags drops the nag bookkeeping for anything no longer open.
+	if err := e.Store.PruneGateNags(); err != nil {
+		e.Log.Printf("prune gate nags: %v", err)
+	}
 }
 
 // admitNextLocked pulls the oldest queued run into the freed slot.

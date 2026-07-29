@@ -1,0 +1,16 @@
+name: gateflow
+trigger: {kind: manual}
+inputs:
+  marker: {type: string, required: true}
+start: attention
+states:
+  attention:
+    step: gate
+    gate:
+      kind: choice
+      recheck: {command: "scripts/recheck.sh $input.marker", every: 1m}
+      payload: "the pipeline is red"
+      options: [accept, abandon]
+    on: {green: recovered, accept: done, abandon: done}
+  recovered: {terminal: true}
+  done: {terminal: true}

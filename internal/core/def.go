@@ -57,6 +57,13 @@ type GateSpec struct {
 	Kind    GateKind `yaml:"kind"`
 	Payload string   `yaml:"payload"` // template; $refs resolved against run context
 	Options []string `yaml:"options,omitempty"`
+	// Recheck re-evaluates the condition that raised this gate, before every
+	// nag. A gate is a claim about the world ("the pipeline is RED"), and the
+	// world moves: one such gate nagged for twenty hours about a flake that
+	// had gone green three minutes later, and there was no way to tell it so.
+	// A recheck whose outcome differs from the raising one closes the gate and
+	// advances the run on the new outcome — no human required.
+	Recheck *ProbeSpec `yaml:"recheck,omitempty"`
 }
 
 // ProbeSpec is a probe evaluated on a cadence inside a wait arm: either a

@@ -1,0 +1,22 @@
+name: stallflow
+trigger: {kind: manual}
+inputs:
+  key: {type: string, required: true}
+start: early
+states:
+  # `echo` is armed here and nowhere downstream, so one arriving while the run
+  # stands in `late` can never be consumed — the shape the stall guard exists for.
+  early:
+    step: wait
+    arms:
+      - {event: go, correlate: $input.key}
+      - {event: echo, correlate: $input.key}
+      - {timeout: 1h}
+    on: {go: late, echo: early, timeout: done}
+  late:
+    step: wait
+    arms:
+      - {event: finish, correlate: $input.key}
+      - {timeout: 1h}
+    on: {finish: done, timeout: done}
+  done: {terminal: true}

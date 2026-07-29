@@ -29,6 +29,13 @@ type Meta struct {
 	// Alerts names events that must never be silently dropped: one with no
 	// consumer raises a gate instead of vanishing into the log.
 	Alerts []string `yaml:"alerts,omitempty"`
+	// Advisory names the opposite: events that inform and never instruct.
+	// A ticket moving to in_progress is a fact about the past; a run that
+	// buffered one and walked past the state arming it has nothing to do
+	// with it, so the stall guard drops it instead of asking a human whether
+	// to jump the run backwards. Every stall gate raised in one week was
+	// answered "discard", all of them for events named here.
+	Advisory []string `yaml:"advisory,omitempty"`
 	// Contact declares this workspace's human channels as workspace scripts
 	// (JSON in, JSON out — the probe contract). A chat tool is environment,
 	// so it lives here rather than in the engine.
@@ -91,6 +98,7 @@ type Workspace struct {
 	Doctor []DoctorCheck
 
 	Alerts    []string
+	Advisory  []string
 	Contact   map[string]ContactChannel
 	Envs      map[string]map[string]string
 	Repos     map[string]string
@@ -129,6 +137,7 @@ func Load(path string) (*Workspace, []error) {
 	ws.Repos = meta.Repos
 	ws.Envs = meta.Envs
 	ws.Alerts = meta.Alerts
+	ws.Advisory = meta.Advisory
 	ws.Contact = meta.Contact
 	for _, name := range sortedKeys(meta.Contact) {
 		if err := checkScript(path, meta.Contact[name].Command); err != nil {

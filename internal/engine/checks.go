@@ -215,11 +215,20 @@ func (e *Engine) ResumeRun(runID string) error {
 	}
 	switch run.Status {
 	case core.StatusBlocked, core.StatusNeedsAttention:
+	case core.StatusGated:
+		// A gate is a claim about the world, and the world moves. When the
+		// claim has expired — a "pipeline RED" that went green, a "builder
+		// silent" that has since pushed — every option on the gate is a way of
+		// answering a question that no longer applies, and refusing to resume
+		// left the operator choosing between a false answer and killing the
+		// run. Cancelling the gate and re-entering the state re-asks the
+		// question against the world as it is now.
 	default:
-		return fmt.Errorf("run %s is %s — only blocked or needs-attention runs resume", runID, run.Status)
+		return fmt.Errorf("run %s is %s — only blocked, needs-attention or gated runs resume", runID, run.Status)
 	}
 	if g, _ := e.Store.OpenGateForRun(runID); g != nil {
 		e.Store.CancelGate(g.ID, e.Clock.Now())
+		e.event(run.ID, g.State, "gate-retired", map[string]any{"gate": g.ID, "reason": "operator resume"}, run.Workspace)
 	}
 	delete(run.Context, "blocked")
 	def, err := e.runDef(run)

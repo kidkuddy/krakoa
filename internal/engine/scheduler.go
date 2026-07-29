@@ -110,6 +110,16 @@ func (e *Engine) sweepStalledSignals() {
 			if now.Sub(sig.At) < StallGuardAfter || consumableFrom(def, run.State, sig.Event) {
 				continue
 			}
+			// Advisory events inform, they do not instruct. Asking a human
+			// whether to jump the run backwards to consume a stale "ticket
+			// moved to in_progress" is a question with one answer — every
+			// stall gate raised in a week was answered "discard" — so drop it
+			// and say so in the log rather than in Slack.
+			if ws := e.Workspaces[run.Workspace]; ws != nil && isAlert(ws.Advisory, sig.Event) {
+				e.Store.ConsumeSignal(sig.ID)
+				e.event(run.ID, run.State, "signal-discarded", map[string]any{"event": sig.Event, "via": "advisory"}, run.Workspace)
+				continue
+			}
 			e.openGateLocked(*run, core.ActionOpenGate{
 				State: stallStatePrefix + sig.Event,
 				Kind:  core.GateChoice,
