@@ -45,7 +45,11 @@ func (e *Engine) Tick() {
 	e.sweepStalledSignals()
 	e.sweepChecks()
 	e.sweepDeliveries()
+	e.sweepReload()
 }
+
+// reloadSweepEvery is how often the daemon looks for workspace edits on disk.
+const reloadSweepEvery = 10 * time.Second
 
 // StallGuardAfter is how long a buffered signal may sit unusable before the
 // guard asks a human.

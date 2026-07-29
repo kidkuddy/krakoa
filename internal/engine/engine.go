@@ -43,6 +43,18 @@ type Engine struct {
 	Workspaces map[string]*workspace.Workspace
 	DataDir    string // per-step base dirs live here
 
+	// WorkspacePaths are the dirs LoadWorkspaces reads. A path that fails to
+	// load stays here and keeps being retried — fixing a broken workspace
+	// takes effect the same way editing a working one does.
+	WorkspacePaths []string
+	// Invalid holds the load errors per path from the last read.
+	Invalid map[string][]string
+	// OnWorkspaces, when set, runs after each successful load with the lock
+	// held: whatever the daemon derives from workspace config (contact
+	// channels) is rebuilt there, so an edit to it is not silently ignored.
+	OnWorkspaces func()
+	lastReload   time.Time
+
 	// Spawn runs an agent-step job: `go f()` in the daemon, `f()` in tests
 	// (deterministic, synchronous seam tests).
 	Spawn func(f func())
@@ -134,6 +146,115 @@ func New(st *store.Store, rn runner.Runner, clk Clock, wss map[string]*workspace
 		Exec:          realExec,
 		Log:           log.New(os.Stdout, "", log.LstdFlags),
 	}
+}
+
+// LoadWorkspaces reads every configured path and swaps the result in, keeping
+// the previous copy of any path that now fails to load — a typo in one file
+// must not take a running workspace away. Startup and reload call this same
+// function, so the daemon can never serve a config a restart would not.
+func (e *Engine) LoadWorkspaces() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.loadWorkspacesLocked()
+}
+
+func (e *Engine) loadWorkspacesLocked() {
+	e.lastReload = e.Clock.Now()
+	next := map[string]*workspace.Workspace{}
+	invalid := map[string][]string{}
+	for _, p := range e.WorkspacePaths {
+		ws, errs := workspace.Load(p)
+		if len(errs) > 0 {
+			var msgs []string
+			for _, err := range errs {
+				msgs = append(msgs, err.Error())
+			}
+			invalid[p] = msgs
+			e.Log.Printf("REFUSED workspace %s:", p)
+			for _, m := range msgs {
+				e.Log.Printf("  - %s", m)
+			}
+			// keep whatever was serving this path before
+			for _, old := range e.Workspaces {
+				if old.Path == p {
+					next[old.Name] = old
+				}
+			}
+			continue
+		}
+		next[ws.Name] = ws
+		e.Log.Printf("loaded workspace %s (%s, git %s): %d workflows, %d agents, %d watchers",
+			ws.Name, p, ws.GitVersion, len(ws.Workflows), len(ws.Agents), len(ws.Watchers))
+	}
+	e.Workspaces, e.Invalid = next, invalid
+	if e.OnWorkspaces != nil {
+		e.OnWorkspaces()
+	}
+}
+
+// WorkspaceInfo is one inventory row: what is loaded, from where, when it was
+// read, and how far the files on disk have moved since.
+type WorkspaceInfo struct {
+	Name       string
+	Path       string
+	GitVersion string
+	Dirty      []string
+	LoadedAt   time.Time
+	Doctor     []workspace.DoctorCheck
+}
+
+// Inventory snapshots the loaded workspaces and the paths that failed to
+// load. Reload swaps the map under the lock, so callers must never range it
+// themselves.
+func (e *Engine) Inventory() ([]WorkspaceInfo, map[string][]string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := []WorkspaceInfo{}
+	for _, name := range sortedWorkspaces(e.Workspaces) {
+		ws := e.Workspaces[name]
+		out = append(out, WorkspaceInfo{
+			Name: ws.Name, Path: ws.Path, GitVersion: ws.GitVersion,
+			Dirty: ws.Dirty, LoadedAt: ws.LoadedAt, Doctor: ws.Doctor,
+		})
+	}
+	invalid := map[string][]string{}
+	for p, msgs := range e.Invalid {
+		invalid[p] = msgs
+	}
+	return out, invalid
+}
+
+// sweepReload re-reads the workspaces when their files have moved past what
+// is in memory. The daemon used to hold its startup copy for its whole
+// lifetime, so a config change sat on disk while runs used the version before
+// it — green validate, green doctor, wrong runtime.
+//
+// A definition edit must not land under a run whose agent is mid-step, which
+// is the same condition a restart already carries, so the reload waits for
+// the last running step to finish.
+func (e *Engine) sweepReload() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// `now` is read BEFORE the scan: a file written while the scan runs must
+	// come out newer than the baseline it is measured against next time, or
+	// an edit landing in that window would be invisible forever.
+	now := e.Clock.Now()
+	if len(e.WorkspacePaths) == 0 || now.Sub(e.lastReload) < reloadSweepEvery {
+		return
+	}
+	changed := 0
+	for _, p := range e.WorkspacePaths {
+		changed += workspace.ChangedSince(p, e.lastReload)
+	}
+	if changed == 0 {
+		e.lastReload = now // nothing moved as of `now`; re-arm the cadence
+		return
+	}
+	if running, err := e.Store.ListRuns(core.StatusRunning); err != nil || len(running) > 0 {
+		return // hold the edit until no agent step is mid-flight
+	}
+	e.Log.Printf("workspace files changed (%d) — reloading", changed)
+	e.loadWorkspacesLocked()
 }
 
 func (e *Engine) def(ws, wf string) (*workspace.Workspace, *core.WorkflowDefinition, error) {
@@ -267,6 +388,15 @@ func (e *Engine) startRunLocked(wsName, wfName, entryName string, inputs map[str
 			env[k] = v
 		}
 		run.Context["env"] = env
+	}
+	// Same for the repo: agent working folders resolve through the repos:
+	// map, so an unknown key is a configuration error the submitter can fix.
+	// Caught here it is one CLI error; caught later it was an admitted run,
+	// a started step, a git ENOENT, a parked run and an open gate.
+	if key, _ := inputs["repo"].(string); key != "" && len(ws.Repos) > 0 {
+		if _, err := ws.Repo(key); err != nil {
+			return nil, err
+		}
 	}
 	// A verb's seed stands in for the states an earlier run already walked,
 	// so everything downstream ($filing.ticket_id, the thread key, the
@@ -723,6 +853,27 @@ func (e *Engine) answerGateLocked(gateID, response string, answers map[string]an
 // --- agent steps ---
 
 func (e *Engine) startAgentStepLocked(def *core.WorkflowDefinition, run core.Run, act core.ActionRunAgent) {
+	ws := e.Workspaces[run.Workspace]
+	spec := ws.Agents[act.Agent]
+	// Working folders may be templates ("$input.repo") and resolve through
+	// the workspace repos: map — the refiner must follow the repo input,
+	// never a hardcoded clone. Resolve before the step exists: a workspace
+	// that cannot name the folder is a config error, and retrying it is
+	// spending an agent on something no attempt can fix.
+	if spec.WorkingFolder != "" {
+		folder, err := ws.Repo(core.Interpolate(&run, spec.WorkingFolder))
+		if err != nil {
+			e.event(run.ID, act.State, "config-error", map[string]any{"agent": act.Agent, "error": err.Error()}, run.Workspace)
+			e.parkLocked(run, fmt.Sprintf("the %s step cannot start: %v", act.State, err))
+			return
+		}
+		if folder != spec.WorkingFolder {
+			cp := *spec
+			cp.WorkingFolder = folder
+			spec = &cp
+		}
+	}
+
 	prior, _ := e.Store.StepsForRun(run.ID)
 	attempt := 1
 	for _, p := range prior {
@@ -740,22 +891,6 @@ func (e *Engine) startAgentStepLocked(def *core.WorkflowDefinition, run core.Run
 	}
 	e.event(run.ID, act.State, "step-started", map[string]any{"step": st.ID, "agent": act.Agent, "attempt": attempt}, run.Workspace)
 
-	ws := e.Workspaces[run.Workspace]
-	spec := ws.Agents[act.Agent]
-	// Working folders may be templates ("$input.repo") and resolve through
-	// the workspace repos: map — the refiner must follow the repo input,
-	// never a hardcoded clone.
-	if spec.WorkingFolder != "" {
-		folder := core.Interpolate(&run, spec.WorkingFolder)
-		if mapped, ok := ws.Repos[folder]; ok {
-			folder = mapped
-		}
-		if folder != spec.WorkingFolder {
-			cp := *spec
-			cp.WorkingFolder = folder
-			spec = &cp
-		}
-	}
 	skills := map[string]string{}
 	for _, sk := range spec.Skills {
 		skills[sk] = ws.Skills[sk]

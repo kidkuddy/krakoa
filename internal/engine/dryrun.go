@@ -171,7 +171,17 @@ func dryWalk(ws *workspace.Workspace, def *core.WorkflowDefinition, entryName st
 	}
 	inputs := map[string]any{}
 	for name, spec := range entry.Inputs {
-		if spec.Default == "" {
+		if spec.Default != "" {
+			continue
+		}
+		// Inputs naming a workspace fact are checked at admission, so a
+		// fabricated "dry-repo" would fail the walk before it started.
+		switch {
+		case name == "repo" && len(ws.Repos) > 0:
+			inputs[name] = sortedKeys(ws.Repos)[0]
+		case name == "env" && len(ws.Envs) > 0:
+			inputs[name] = sortedKeys(ws.Envs)[0]
+		default:
 			inputs[name] = "dry-" + name
 		}
 	}

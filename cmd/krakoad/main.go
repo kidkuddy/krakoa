@@ -23,7 +23,6 @@ import (
 	"github.com/kidkuddy/krakoa/internal/engine"
 	"github.com/kidkuddy/krakoa/internal/runner"
 	"github.com/kidkuddy/krakoa/internal/store"
-	"github.com/kidkuddy/krakoa/internal/workspace"
 )
 
 func env(key, def string) string {
@@ -61,35 +60,6 @@ func main() {
 	os.MkdirAll(filepath.Dir(dbPath), 0o755)
 	os.MkdirAll(dataDir, 0o755)
 
-	// Load every workspace; refuse broken ones, keep serving the rest.
-	workspaces := map[string]*workspace.Workspace{}
-	invalid := map[string][]string{}
-	for _, p := range strings.Split(wsPaths, ",") {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		ws, errs := workspace.Load(p)
-		if len(errs) > 0 {
-			var msgs []string
-			for _, e := range errs {
-				msgs = append(msgs, e.Error())
-			}
-			invalid[p] = msgs
-			log.Printf("REFUSED workspace %s:", p)
-			for _, m := range msgs {
-				log.Printf("  - %s", m)
-			}
-			continue
-		}
-		workspaces[ws.Name] = ws
-		log.Printf("loaded workspace %s (%s, git %s): %d workflows, %d agents, %d watchers",
-			ws.Name, p, ws.GitVersion, len(ws.Workflows), len(ws.Agents), len(ws.Watchers))
-	}
-	if len(workspaces) == 0 {
-		log.Fatal("no valid workspaces")
-	}
-
 	st, err := store.Open(dbPath)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
@@ -102,8 +72,13 @@ func main() {
 	}
 	log.Printf("claude binary: %s", bin)
 
-	eng := engine.New(st, &runner.Claude{Bin: bin}, engine.RealClock{}, workspaces, dataDir)
-	eng.Channels = []contact.Channel{&contact.Console{W: os.Stdout}}
+	eng := engine.New(st, &runner.Claude{Bin: bin}, engine.RealClock{}, nil, dataDir)
+	for _, p := range strings.Split(wsPaths, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			eng.WorkspacePaths = append(eng.WorkspacePaths, p)
+		}
+	}
+	base := []contact.Channel{&contact.Console{W: os.Stdout}}
 	if nifftyTo != "" {
 		nf := contact.NewNiffty(nifftyURL, nifftyTo)
 		nf.Bin = os.Getenv("KRAKOA_NIFFTY_BIN")
@@ -111,7 +86,7 @@ func main() {
 		nf.ThreadTS = func(runID string) string { return eng.ThreadRefForRun(runID, "slack_ts") }
 		nf.SaveRef = func(runID, kind, value string) { eng.Bind(runID, kind, value) }
 		nf.Log = log.Printf
-		eng.Channels = append(eng.Channels, nf)
+		base = append(base, nf)
 		if nf.Bin != "" {
 			board := &contact.NifftyBoard{
 				Bin: nf.Bin,
@@ -136,29 +111,38 @@ func main() {
 	if chanURL != "" {
 		cn := contact.NewChan(chanURL, os.Getenv("KRAKOA_CHAN_START"))
 		cn.Only = splitList(os.Getenv("KRAKOA_CHAN_WORKSPACES"))
-		eng.Channels = append(eng.Channels, cn)
+		base = append(base, cn)
 	}
 	// Workspace-declared channels. The engine learns nothing about the tool on
 	// the other end: it execs a script with JSON on stdin. Declaration is also
 	// the scope — a channel serves the workspace that declared it, so there is
-	// no routing to configure.
-	for _, ws := range workspaces {
-		for _, name := range sortedNames(ws.Contact) {
-			c := ws.Contact[name]
-			eng.Channels = append(eng.Channels, &contact.Script{
-				ChannelName: name, Workspace: ws.Name, Dir: ws.Path,
-				Command: c.Command, Timeout: c.Timeout.D(),
-				Refs:    func(runID string) map[string]string { return eng.ThreadRefsForRun(runID) },
-				SaveRef: func(runID, kind, value string) { eng.Bind(runID, kind, value) },
-			})
-			log.Printf("contact %s/%s -> %s", ws.Name, name, c.Command)
+	// no routing to configure. Rebuilt on every load: a contact edit is config
+	// like any other, and a reload that skipped it would be a quiet trap.
+	eng.OnWorkspaces = func() {
+		chans := append([]contact.Channel(nil), base...)
+		for _, ws := range eng.Workspaces {
+			for _, name := range sortedNames(ws.Contact) {
+				c := ws.Contact[name]
+				chans = append(chans, &contact.Script{
+					ChannelName: name, Workspace: ws.Name, Dir: ws.Path,
+					Command: c.Command, Timeout: c.Timeout.D(),
+					Refs:    func(runID string) map[string]string { return eng.ThreadRefsForRun(runID) },
+					SaveRef: func(runID, kind, value string) { eng.Bind(runID, kind, value) },
+				})
+				log.Printf("contact %s/%s -> %s", ws.Name, name, c.Command)
+			}
 		}
+		eng.Channels = chans
+	}
+	eng.LoadWorkspaces()
+	if len(eng.Workspaces) == 0 {
+		log.Fatal("no valid workspaces")
 	}
 
 	eng.Recover()
 	log.Printf("recovered; listening on %s", addr)
 
-	mux := api(eng, st, workspaces, invalid)
+	mux := api(eng, st)
 	srv := &http.Server{Addr: addr, Handler: mux}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -176,7 +160,7 @@ func main() {
 	log.Print("bye")
 }
 
-func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.Workspace, invalid map[string][]string) *http.ServeMux {
+func api(eng *engine.Engine, st *store.Store) *http.ServeMux {
 	mux := http.NewServeMux()
 	writeJSON := func(w http.ResponseWriter, code int, v any) {
 		w.Header().Set("Content-Type", "application/json")
@@ -191,9 +175,10 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 	mux.Handle("GET /ui/", uiHandler())
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		loaded, invalid := eng.Inventory()
 		wss := map[string]string{}
-		for name, ws := range workspaces {
-			wss[name] = ws.GitVersion
+		for _, ws := range loaded {
+			wss[ws.Name] = ws.GitVersion
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "workspaces": wss, "invalid": invalid})
 	})
@@ -201,16 +186,7 @@ func api(eng *engine.Engine, st *store.Store, workspaces map[string]*workspace.W
 	// Slim workspace inventory so clients (doctor) never need
 	// KRAKOA_WORKSPACES themselves — the daemon owns workspaces.
 	mux.HandleFunc("GET /v1/workspaces", func(w http.ResponseWriter, r *http.Request) {
-		type wsInfo struct {
-			Name       string
-			Path       string
-			GitVersion string
-			Doctor     []workspace.DoctorCheck
-		}
-		out := []wsInfo{}
-		for _, ws := range workspaces {
-			out = append(out, wsInfo{Name: ws.Name, Path: ws.Path, GitVersion: ws.GitVersion, Doctor: ws.Doctor})
-		}
+		out, _ := eng.Inventory()
 		writeJSON(w, 200, out)
 	})
 
