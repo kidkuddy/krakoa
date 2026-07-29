@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kidkuddy/krakoa/internal/core"
@@ -179,5 +180,63 @@ func TestOpenedThreadWithoutSessionRelaysIntoTheThread(t *testing.T) {
 	}
 	if f.sends[0]["thread_ts"] != "1785.0001" {
 		t.Fatalf("relayed to thread %q, want the opened thread", f.sends[0]["thread_ts"])
+	}
+}
+
+// The ANSWER-block ritual — "fill the blocks in the canvas, then reply done" —
+// was completed zero times out of roughly ten in a week. Every one was answered
+// in the thread after the session retyped the questions there, and twice the
+// canvas never arrived at all. Short questions go inline.
+func TestShortQuestionsRenderInline(t *testing.T) {
+	g := &core.Gate{
+		ID: "g-1", RunID: "r-1", Kind: core.GateQuestion,
+		Payload:   "questions on the phone-number gate",
+		Questions: []string{"steal a number off another campaign, or only a free one?", "extract the provisioning flow, or a narrower path?"},
+	}
+	got := gateText(g, "")
+
+	for _, want := range []string{
+		"questions on the phone-number gate",
+		"1. steal a number off another campaign",
+		"2. extract the provisioning flow",
+		"reply in this thread, numbered.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("gate text missing %q:\n%s", want, got)
+		}
+	}
+	// Nothing may send the human to a terminal: that instruction is why forty
+	// gates in a week were answered by typing an option and spending a turn.
+	if strings.Contains(got, "krakoactl") {
+		t.Errorf("gate text still tells the human to run a CLI:\n%s", got)
+	}
+	if strings.Contains(got, "ANSWER") || strings.Contains(got, "reply done") {
+		t.Errorf("gate text still asks for the canvas ritual:\n%s", got)
+	}
+}
+
+// A canvas is a place to go, not a thing to read, so the trip is only worth
+// making when the questions genuinely do not fit a message.
+func TestCanvasOnlyForLongQuestionBlocks(t *testing.T) {
+	short := &core.Gate{Kind: core.GateQuestion, Payload: "three small calls", Questions: []string{"a?", "b?"}}
+	if questionsLen(short) > canvasThreshold {
+		t.Fatalf("a two-line gate would have spent a canvas (%d chars)", questionsLen(short))
+	}
+
+	long := &core.Gate{Kind: core.GateQuestion, Payload: strings.Repeat("x", 400)}
+	for i := 0; i < 6; i++ {
+		long.Questions = append(long.Questions, strings.Repeat("q", 120))
+	}
+	if questionsLen(long) <= canvasThreshold {
+		t.Fatalf("a six-question gate should earn its canvas (%d chars)", questionsLen(long))
+	}
+
+	// When one is made, it is offered as detail — never as the place to answer.
+	got := gateText(long, "https://slack/docs/CANVAS")
+	if !strings.Contains(got, "full detail: https://slack/docs/CANVAS") {
+		t.Errorf("canvas not offered as detail:\n%s", got)
+	}
+	if !strings.Contains(got, "reply in this thread") {
+		t.Errorf("long gate stopped saying where to answer:\n%s", got)
 	}
 }

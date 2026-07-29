@@ -109,9 +109,21 @@ type event struct {
 	Wake bool `json:"wake"`
 }
 
+// canvasThreshold is how long a rendered question block has to be before it is
+// worth a canvas. Below it the questions go inline, because a canvas is a place
+// to go rather than a thing to read, and the trip is only worth making when the
+// content genuinely does not fit a message.
+const canvasThreshold = 900
+
 func (n *Niffty) Deliver(g *core.Gate) error {
 	var canvas string
-	if g.Kind == core.GateQuestion && n.Bin != "" && len(g.Questions) > 0 {
+	// The ANSWER-block ritual — "fill the blocks in the canvas, then reply
+	// done" — was completed zero times out of roughly ten in a week. Every one
+	// was answered in the thread instead, after the session retyped the
+	// questions there; twice the canvas never arrived at all. So questions go
+	// inline by default and the canvas is kept for the ones too long to read in
+	// a message.
+	if g.Kind == core.GateQuestion && n.Bin != "" && len(g.Questions) > 0 && questionsLen(g) > canvasThreshold {
 		if link, err := n.createCanvas(g); err == nil {
 			if n.SaveRef != nil {
 				n.SaveRef(g.RunID, "canvas:"+g.ID, link)
@@ -140,22 +152,35 @@ func (n *Niffty) Notify(no *core.Notice) error {
 // "[Q1 …? Q2 …?]". The questions travel structurally, so they are rendered
 // structurally.
 func gateText(g *core.Gate, canvas string) string {
-	if canvas != "" {
-		return fmt.Sprintf("questions on %s — fill the ANSWER blocks in the canvas, then reply done (or run: krakoactl harvest %s)\n%s", g.RunID, g.ID, canvas)
-	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n[%s]", g.Payload, g.ID)
+	b.WriteString(g.Payload)
 	for i, q := range g.Questions {
 		fmt.Fprintf(&b, "\n%d. %s", i+1, q)
 	}
 	if len(g.Questions) > 0 {
 		b.WriteString("\nreply in this thread, numbered.")
 	}
-	if len(g.Options) > 0 {
-		b.WriteString("\noptions: " + strings.Join(g.Options, " | "))
+	if canvas != "" {
+		// Only reached when the questions are too long to read in a message.
+		// The canvas is detail, never the place to answer.
+		fmt.Fprintf(&b, "\nfull detail: %s", canvas)
 	}
-	fmt.Fprintf(&b, "\nanswer: krakoactl answer %s <response>", g.ID)
+	// Options are rendered as buttons by niffty and the id is what `//why` and
+	// krakoactl take, so neither belongs in the sentence. Nothing here tells the
+	// human to go run a CLI: that instruction was the reason forty gates in a
+	// week were answered by typing an option and spending a turn on it.
+	fmt.Fprintf(&b, "\n[%s]", g.ID)
 	return b.String()
+}
+
+// questionsLen is how much text the questions would add to a message — what
+// decides whether a canvas earns its trip.
+func questionsLen(g *core.Gate) int {
+	n := len(g.Payload)
+	for _, q := range g.Questions {
+		n += len(q) + 4
+	}
+	return n
 }
 
 // post routes through the thread's agent session when the run has a Slack
