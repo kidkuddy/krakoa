@@ -84,6 +84,11 @@ type Engine struct {
 	checks         map[string]*checkResult
 	lastCheckSweep time.Time
 
+	// pauses mirrors the store's pause table. The store is the source of
+	// truth (a pause must survive a restart); this is the copy the admission
+	// and step-start paths read without touching SQLite under the lock.
+	pauses []core.Pause
+
 	lastDeliverySweep time.Time
 
 	// Exec runs a deterministic command probe (cwd = workspace dir) and
@@ -133,7 +138,7 @@ func (e *Engine) drain() {
 }
 
 func New(st *store.Store, rn runner.Runner, clk Clock, wss map[string]*workspace.Workspace, dataDir string) *Engine {
-	return &Engine{
+	e := &Engine{
 		Store:         st,
 		Runner:        rn,
 		Clock:         clk,
@@ -146,6 +151,10 @@ func New(st *store.Store, rn runner.Runner, clk Clock, wss map[string]*workspace
 		Exec:          realExec,
 		Log:           log.New(os.Stdout, "", log.LstdFlags),
 	}
+	// Before anything can be admitted or recovered: a daemon that starts up
+	// having forgotten it was paused spawns the sessions it was paused to stop.
+	e.reloadPauses()
+	return e
 }
 
 // LoadWorkspaces reads every configured path and swaps the result in, keeping
@@ -579,6 +588,13 @@ func (e *Engine) projectBoardLocked(run *core.Run) {
 }
 
 func (e *Engine) admitLocked(def *core.WorkflowDefinition, run *core.Run) {
+	// Held, not blocked: it never entered the machine, so there is nothing to
+	// re-enter. Unpausing admits it through the ordinary queue.
+	if reason, paused := e.heldLocked(run); paused {
+		e.event(run.ID, run.State, "run-held", map[string]any{"reason": reason}, run.Workspace)
+		e.projectBoardLocked(run)
+		return
+	}
 	if check, detail := e.checkFailingLocked(run.Workspace, def.Requires); check != "" {
 		e.blockLocked(def, *run, check, detail)
 		return
@@ -604,6 +620,15 @@ func (e *Engine) applyLocked(def *core.WorkflowDefinition, d core.Decision) {
 		if check, detail := e.checkFailingLocked(run.Workspace, def.States[run.State].Requires); check != "" {
 			e.blockLocked(def, run, check, detail)
 			return
+		}
+		// A paused workflow starts no sessions. Parking before the action loop
+		// keeps the decision all-or-nothing: no lifecycle notice announcing a
+		// step that is not about to run.
+		if startsAgent(d) {
+			if reason, paused := e.heldLocked(&run); paused {
+				e.blockLocked(def, run, PausedCheck, reason)
+				return
+			}
 		}
 	}
 	for _, a := range d.Actions {
@@ -653,6 +678,16 @@ func (e *Engine) retireGatesLocked(run core.Run, reason string) {
 	}
 }
 
+// startsAgent reports whether a decision is about to spawn a session.
+func startsAgent(d core.Decision) bool {
+	for _, a := range d.Actions {
+		if _, ok := a.(core.ActionRunAgent); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // admitNextLocked pulls the oldest queued run into the freed slot.
 func (e *Engine) admitNextLocked(def *core.WorkflowDefinition, ws, wf string) {
 	if def.Concurrency <= 0 {
@@ -662,11 +697,27 @@ func (e *Engine) admitNextLocked(def *core.WorkflowDefinition, ws, wf string) {
 	if err != nil || active >= def.Concurrency {
 		return
 	}
-	next, err := e.Store.NextQueued(ws, wf)
-	if err != nil || next == nil {
+	if _, paused := e.pausedLocked(ws, wf); !paused {
+		next, err := e.Store.NextQueued(ws, wf)
+		if err != nil || next == nil {
+			return
+		}
+		e.admitLocked(def, next)
 		return
 	}
-	e.admitLocked(def, next)
+	// Under a pause the head of the queue is usually held, and stopping there
+	// would strand an allowed run sitting behind it. Walk to the first one
+	// that may actually start.
+	queue, err := e.Store.QueuedRuns(ws, wf)
+	if err != nil {
+		return
+	}
+	for _, run := range queue {
+		if _, held := e.heldLocked(run); !held {
+			e.admitLocked(def, run)
+			return
+		}
+	}
 }
 
 // notifyStepLocked delivers a lifecycle line through the same channel gates

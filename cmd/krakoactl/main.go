@@ -33,6 +33,11 @@ const usage = `usage: krakoactl <command> [args]
   checks                                             live prerequisite board (what is blocking runs)
   resume <run-id>                                    un-block / re-enter a parked run
   cancel <run-id> [reason...]                        stop a run wherever it stands
+  pause [--workspace ws] [--workflow wf] [reason...] suspend work (no workspace = everything)
+  pause --run <run-id> [reason...]                   hold one run
+  unpause [--workspace ws] [--workflow wf]           lift a pause and let the work go
+  unpause --run <run-id>                             let ONE run through a standing pause
+  pauses                                             list what is suspended, and what is allowed through
   emit <event> --workspace <ws> [--key k] [--run id] [--payload json]
   workspace validate <path>                          load + validate a workspace dir
   workspace dry-run <path> <workflow>                simulate a workflow end to end
@@ -70,6 +75,12 @@ func main() {
 		err = cmdResume(os.Args[2:])
 	case "cancel":
 		err = cmdCancel(os.Args[2:])
+	case "pause":
+		err = cmdPause(os.Args[2:])
+	case "unpause":
+		err = cmdUnpause(os.Args[2:])
+	case "pauses":
+		err = cmdPauses()
 	case "emit":
 		err = cmdEmit(os.Args[2:])
 	case "workspace":
@@ -211,6 +222,9 @@ func cmdRuns(args []string) error {
 	if err := call("GET", path, nil, &runs); err != nil {
 		return err
 	}
+	// A paused daemon looks exactly like an idle one from here. Say so before
+	// the table, not after someone spends ten minutes wondering.
+	printPauseBanner()
 	if len(runs) == 0 {
 		fmt.Println("no runs")
 		return nil
@@ -303,6 +317,130 @@ func cmdCancel(args []string) error {
 	}
 	fmt.Printf("canceled %s\n", args[0])
 	return nil
+}
+
+func cmdPause(args []string) error {
+	fs := flag.NewFlagSet("pause", flag.ExitOnError)
+	ws := fs.String("workspace", "", "workspace name (default: every loaded one)")
+	wf := fs.String("workflow", "", "workflow name (default: the whole workspace)")
+	run := fs.String("run", "", "hold one run by id")
+	pos, err := parseAnywhere(fs, args)
+	if err != nil {
+		return err
+	}
+	if *run != "" {
+		if err := call("POST", "/v1/runs/"+*run+"/pause", map[string]any{"reason": strings.Join(pos, " ")}, nil); err != nil {
+			return err
+		}
+		fmt.Printf("paused %s — it stops before its next step\n", *run)
+		return nil
+	}
+	var out struct {
+		Paused []struct {
+			Workspace, Workflow, Reason string
+		}
+	}
+	if err := call("POST", "/v1/pause", map[string]any{
+		"workspace": *ws, "workflow": *wf, "reason": strings.Join(pos, " "),
+	}, &out); err != nil {
+		return err
+	}
+	for _, p := range out.Paused {
+		fmt.Printf("paused %s\n", scopeOf(p.Workspace, p.Workflow))
+	}
+	fmt.Println("in-flight steps finish; nothing new starts. `krakoactl unpause` to let it go.")
+	return nil
+}
+
+func cmdUnpause(args []string) error {
+	fs := flag.NewFlagSet("unpause", flag.ExitOnError)
+	ws := fs.String("workspace", "", "workspace name (default: every paused one)")
+	wf := fs.String("workflow", "", "workflow name (default: the whole workspace)")
+	run := fs.String("run", "", "let one run through, leaving the pause standing")
+	if _, err := parseAnywhere(fs, args); err != nil {
+		return err
+	}
+	if *run != "" {
+		if err := call("POST", "/v1/runs/"+*run+"/unpause", nil, nil); err != nil {
+			return err
+		}
+		fmt.Printf("released %s — everything else stays paused\n", *run)
+		return nil
+	}
+	var out struct{ Resumed int }
+	if err := call("POST", "/v1/unpause", map[string]any{"workspace": *ws, "workflow": *wf}, &out); err != nil {
+		return err
+	}
+	fmt.Printf("unpaused — %d run(s) resumed\n", out.Resumed)
+	return nil
+}
+
+type pauseBoard struct {
+	Scopes []struct {
+		Workspace, Workflow, Reason string
+		Since                       time.Time
+	}
+	Held, Allowed []struct {
+		RunID, Workspace, Workflow, State, Status, Reason string
+	}
+}
+
+func cmdPauses() error {
+	var board pauseBoard
+	if err := call("GET", "/v1/pauses", nil, &board); err != nil {
+		return err
+	}
+	if len(board.Scopes) == 0 && len(board.Held) == 0 {
+		fmt.Println("nothing paused")
+		return nil
+	}
+	for _, p := range board.Scopes {
+		line := fmt.Sprintf("%-28s paused %s", scopeOf(p.Workspace, p.Workflow), p.Since.Format("Jan 2 15:04"))
+		if p.Reason != "" {
+			line += "  — " + p.Reason
+		}
+		fmt.Println(line)
+	}
+	for _, r := range board.Held {
+		line := fmt.Sprintf("%-28s held   %s/%s", r.RunID, r.State, r.Status)
+		if r.Reason != "" {
+			line += "  — " + r.Reason
+		}
+		fmt.Println(line)
+	}
+	// The whole point of the allowlist: what is still moving under the pause.
+	for _, r := range board.Allowed {
+		fmt.Printf("%-28s ALLOWED through the pause  %s/%s\n", r.RunID, r.State, r.Status)
+	}
+	if len(board.Allowed) == 0 && len(board.Scopes) > 0 {
+		fmt.Println("nothing is allowed through (krakoactl unpause --run <id>)")
+	}
+	return nil
+}
+
+// printPauseBanner warns that what follows is a still picture, not a live one.
+// Best-effort: a listing must not fail because the banner could not be drawn.
+func printPauseBanner() {
+	var board pauseBoard
+	if err := call("GET", "/v1/pauses", nil, &board); err != nil || len(board.Scopes) == 0 {
+		return
+	}
+	scopes := make([]string, 0, len(board.Scopes))
+	for _, p := range board.Scopes {
+		scopes = append(scopes, scopeOf(p.Workspace, p.Workflow))
+	}
+	msg := fmt.Sprintf("PAUSED: %s — nothing new starts", strings.Join(scopes, ", "))
+	if n := len(board.Allowed); n > 0 {
+		msg += fmt.Sprintf(", except %d allowed run(s)", n)
+	}
+	fmt.Println(msg + " (krakoactl unpause)")
+}
+
+func scopeOf(ws, wf string) string {
+	if wf == "" {
+		return ws
+	}
+	return ws + "/" + wf
 }
 
 func cmdGates() error {

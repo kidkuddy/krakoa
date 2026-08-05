@@ -187,6 +187,11 @@ func (e *Engine) resumeBlockedLocked(wsName, check string) int {
 		if err != nil {
 			continue
 		}
+		// A check coming back does not override a pause, and lifting a
+		// workspace pause does not override a narrower one still in force.
+		if _, paused := e.heldLocked(run); paused {
+			continue
+		}
 		delete(run.Context, "blocked")
 		active, _ := e.Store.CountActive(run.Workspace, run.Workflow)
 		if def.Concurrency > 0 && active >= def.Concurrency {

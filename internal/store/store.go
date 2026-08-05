@@ -118,6 +118,17 @@ CREATE TABLE IF NOT EXISTS gate_nags (
   escalated INTEGER NOT NULL DEFAULT 0
 );
 
+-- suspended workspaces/workflows. Survives a restart on purpose: a daemon
+-- that forgets it was paused comes back up spawning sessions, which is the
+-- one thing the operator paused it to stop.
+CREATE TABLE IF NOT EXISTS pauses (
+  workspace TEXT NOT NULL,
+  workflow  TEXT NOT NULL DEFAULT '',   -- '' = every workflow in the workspace
+  reason    TEXT NOT NULL DEFAULT '',
+  since     TEXT NOT NULL,
+  PRIMARY KEY (workspace, workflow)
+);
+
 -- contact bindings per effective thread key (run id until the thread
 -- template stamps, migrated to the thread key after)
 CREATE TABLE IF NOT EXISTS thread_refs (
@@ -431,6 +442,28 @@ func (s *Store) NextQueued(workspace, workflow string) (*core.Run, error) {
 		return nil, nil
 	}
 	return r, err
+}
+
+// QueuedRuns lists a workflow's queue oldest-first. NextQueued answers "who is
+// next" when everything is admissible; this answers it when some of the queue
+// is held and the caller has to walk past them.
+func (s *Store) QueuedRuns(workspace, workflow string) ([]*core.Run, error) {
+	rows, err := s.db.Query(`SELECT `+runCols+` FROM runs
+		WHERE workspace=? AND workflow=? AND status='queued' ORDER BY created_at ASC`,
+		workspace, workflow)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*core.Run
+	for rows.Next() {
+		r, err := scanRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // --- steps ---
@@ -846,4 +879,46 @@ func (s *Store) MustOpenGates() []*core.Gate {
 func (s *Store) ClearDedupe(watcher, key string) error {
 	_, err := s.db.Exec(`DELETE FROM watch_dedupe WHERE watcher=? AND key=?`, watcher, key)
 	return err
+}
+
+// SetPause suspends a workspace (workflow "") or one of its workflows.
+// Re-pausing an already-paused scope refreshes the reason and keeps the
+// original `since` — the operator is restating why, not starting over.
+func (s *Store) SetPause(p *core.Pause) error {
+	_, err := s.db.Exec(
+		`INSERT INTO pauses (workspace, workflow, reason, since) VALUES (?,?,?,?)
+		 ON CONFLICT(workspace, workflow) DO UPDATE SET reason=excluded.reason`,
+		p.Workspace, p.Workflow, p.Reason, p.Since.Format(time.RFC3339))
+	return err
+}
+
+// ClearPause lifts one scope and reports whether it was actually paused.
+func (s *Store) ClearPause(ws, wf string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM pauses WHERE workspace=? AND workflow=?`, ws, wf)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// Pauses lists every live pause, workspace-wide ones first.
+func (s *Store) Pauses() ([]core.Pause, error) {
+	rows, err := s.db.Query(
+		`SELECT workspace, workflow, reason, since FROM pauses ORDER BY workspace, workflow`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []core.Pause
+	for rows.Next() {
+		var p core.Pause
+		var since string
+		if err := rows.Scan(&p.Workspace, &p.Workflow, &p.Reason, &since); err != nil {
+			return nil, err
+		}
+		p.Since = parseTS(since)
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }

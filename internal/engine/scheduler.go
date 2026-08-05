@@ -405,6 +405,14 @@ func (e *Engine) fireWatcher(t *store.Timer) {
 	// reschedule on the CURRENT spec cadence, not the one stored when the
 	// timer was first armed — workspace edits to `every` apply on reload
 	e.Store.Reschedule(t.ID, e.Clock.Now().Add(w.Every.D()))
+	// Watchers belong to the workspace, not to one workflow, so only a
+	// workspace-wide pause holds them. The timer stays armed: unpausing gets
+	// the next sweep on cadence rather than a thundering catch-up.
+	if reason, paused := e.pausedLocked(wsName, ""); paused {
+		e.event("", "watcher:"+name, "watcher-paused", map[string]any{"watcher": name, "reason": reason}, wsName)
+		e.mu.Unlock()
+		return
+	}
 	if w.Command != "" {
 		wsPath := ws.Path
 		command := w.Command
@@ -961,6 +969,15 @@ func (e *Engine) fireSchedule(t *store.Timer) {
 		if next, err := sched.Next(e.Clock.Now()); err == nil {
 			e.Store.Reschedule(t.ID, next)
 		}
+	}
+
+	// A paused schedule skips the occurrence rather than banking it: eleven
+	// ceremonies queued behind a pause is a pile to cancel on the way back,
+	// not a backlog anyone wants run.
+	if reason, paused := e.pausedLocked(wsName, wfName); paused {
+		e.event("", scheduleStatePrefix+wfName, "schedule-paused",
+			map[string]any{"workflow": wfName, "reason": reason}, wsName)
+		return
 	}
 
 	if def.Trigger.SkipIfRunning {

@@ -124,18 +124,33 @@ func (c *Claude) prepare(req Request) (string, error) {
 	var cwd string
 	if req.Spec.Worktree && req.Spec.WorkingFolder != "" {
 		cwd = filepath.Join(req.BaseDir, "worktree")
-		wt := exec.Command("git", "-C", req.Spec.WorkingFolder, "worktree", "add", "--detach", cwd)
-		if out, err := wt.CombinedOutput(); err != nil {
-			return "", fmt.Errorf("git worktree add: %w: %s", err, out)
-		}
 	} else {
 		// Non-worktree agents run from a bare home dir; a working folder,
 		// if any, is named in the prompt (skills carry the tooling).
 		cwd = filepath.Join(req.BaseDir, "home")
 	}
 	if req.Resume != "" {
-		// resuming: cwd already prepared by the first attempt
+		// resuming: cwd already prepared by the first attempt. Adding the
+		// worktree again is what the resume path used to do, and `git
+		// worktree add` onto an existing directory is a hard exit 128 — so
+		// every schema retry on a worktree agent failed for a reason that had
+		// nothing to do with the retry.
 		return cwd, nil
+	}
+	if req.Spec.Worktree && req.Spec.WorkingFolder != "" {
+		// A worktree can outlive its step: the daemon is killed mid-run, or a
+		// previous attempt left one registered. Clear both the directory and
+		// git's record of it before adding, or every later attempt inherits
+		// the failure.
+		exec.Command("git", "-C", req.Spec.WorkingFolder, "worktree", "remove", "--force", cwd).Run()
+		exec.Command("git", "-C", req.Spec.WorkingFolder, "worktree", "prune").Run()
+		if err := os.RemoveAll(cwd); err != nil {
+			return "", fmt.Errorf("clear stale worktree %s: %w", cwd, err)
+		}
+		wt := exec.Command("git", "-C", req.Spec.WorkingFolder, "worktree", "add", "--detach", cwd)
+		if out, err := wt.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("git worktree add: %w: %s", err, out)
+		}
 	}
 	if err := os.MkdirAll(cwd, 0o755); err != nil {
 		return "", err
