@@ -91,6 +91,11 @@ type Engine struct {
 
 	lastDeliverySweep time.Time
 
+	// lastGateDigest is the day the silenced-gate digest last went out. In
+	// memory like lastDeliverySweep: a restart costs at most one extra digest,
+	// which is cheaper than a table for it.
+	lastGateDigest time.Time
+
 	// Exec runs a deterministic command probe (cwd = workspace dir) and
 	// returns its stdout. Overridable for dry-run and tests.
 	Exec func(dir, command string) ([]byte, error)
@@ -783,6 +788,17 @@ func (e *Engine) openGateLocked(run core.Run, act core.ActionOpenGate) {
 // 10s of I/O) and records the per-channel outcome when it lands. Failures are
 // retried by sweepDeliveries until the gate is delivered or answered.
 func (e *Engine) deliverLocked(g *core.Gate) {
+	// A watcher that broke at 02:00 is not a 02:00 problem — a stale token or a
+	// tracker 500 cannot be fixed before the morning, and thirty of these
+	// arrived between 20:00 and 04:00 in one stretch. Hold run-less gates: the
+	// gate is open and visible in `krakoactl gates` either way, and
+	// sweepDeliveries carries it out at the start of the working day. Gates
+	// belonging to a run are never held — those are decisions someone is
+	// waiting on.
+	if g.RunID == "" && !inWorkHours(e.Clock.Now()) {
+		e.event(g.RunID, g.State, "gate-delivery-held", map[string]any{"gate": g.ID, "reason": "outside work hours"}, g.Workspace)
+		return
+	}
 	channels := e.channelsFor(g.Workspace)
 	e.pending = append(e.pending, func() {
 		delivery := map[string]string{}

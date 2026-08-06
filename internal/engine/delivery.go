@@ -20,6 +20,15 @@ const (
 	deliverySweepEvery = 10 * time.Minute
 	gateNagAfter       = 2 * time.Hour
 	gateEscalateAfter  = 24 * time.Hour
+	// A gate that has said the same thing three times has said it. Nagging had
+	// no cap at all, so one unanswered gate repeated itself fourteen times over
+	// three days, and a week's worth of that is what made the DM unreadable.
+	// Past the cap a gate is not forgotten — it moves into the morning digest,
+	// which says the same thing once for all of them.
+	gateNagLimit = 3
+	// When the digest goes out. One notice, at the start of the working day,
+	// naming every gate that has stopped nagging on its own.
+	gateDigestHour = 9
 )
 
 func (e *Engine) sweepDeliveries() {
@@ -60,9 +69,20 @@ func (e *Engine) sweepDeliveries() {
 		before := *n
 		switch {
 		case g.RunID == "":
-			// Engine-level (watcher) gates are informational: never redelivered,
-			// never nagged. They live in the UI's infra strip and in
-			// `krakoactl gates`, which is exactly where noise belongs.
+			// Engine-level (watcher) gates are informational: never nagged,
+			// never escalated. They live in the UI's infra strip and in
+			// `krakoactl gates`, which is exactly where noise belongs. They do
+			// get ONE delivery, and deliverLocked holds it out of work hours —
+			// this is where a gate raised overnight is carried out in the
+			// morning instead of waking someone who cannot act on it.
+			if !undelivered(g) || !inWorkHours(now) {
+				continue
+			}
+			if !n.LastTry.IsZero() && now.Sub(n.LastTry) < deliverySweepEvery*time.Duration(1<<min(n.Tries, 4)) {
+				continue
+			}
+			n.LastTry, n.Tries = now, n.Tries+1
+			e.deliverLocked(g)
 		case now.Sub(g.CreatedAt) > gateEscalateAfter && undelivered(g) && n.Tries == 0:
 			// Older than the escalation window: a day-late delivery retry helps
 			// nobody, the escalation below does.
@@ -83,8 +103,12 @@ func (e *Engine) sweepDeliveries() {
 				ID: "escalate-" + g.ID, Workspace: g.Workspace, RunID: g.RunID, State: g.State,
 				Kind: core.NoticeStuck, Text: escalationText(g, now),
 			})
-		case now.Sub(g.CreatedAt) > gateNagAfter && now.Sub(n.LastTry) > gateNagAfter && inWorkHours(now):
+		case now.Sub(g.CreatedAt) > gateNagAfter && now.Sub(n.LastTry) > gateNagAfter && inWorkHours(now) && n.Tries <= gateNagLimit:
+			// Tries counts deliveries and nags together — first sight records 1,
+			// so this is three nags. A gate that burned the budget on delivery
+			// retries nags less, which is the direction to err in.
 			n.LastTry = now
+			n.Tries++
 			e.notifyLocked(&core.Notice{
 				ID: fmt.Sprintf("nag-%s-%d", g.ID, now.Unix()), Workspace: g.Workspace, RunID: g.RunID, State: g.State,
 				Kind: core.NoticeStuck,
@@ -100,6 +124,62 @@ func (e *Engine) sweepDeliveries() {
 	if err := e.Store.PruneGateNags(); err != nil {
 		e.Log.Printf("prune gate nags: %v", err)
 	}
+	e.digestSilencedGatesLocked(gates, nags, now)
+}
+
+// digestSilencedGatesLocked says once, each working morning, what the nag cap
+// has stopped saying. Capping the nag without this would quietly lose gates;
+// the point is to stop repeating them, not to stop mentioning them.
+func (e *Engine) digestSilencedGatesLocked(gates []*core.Gate, nags map[string]*store.GateNag, now time.Time) {
+	if !inWorkHours(now) || now.Hour() != gateDigestHour {
+		return
+	}
+	if !e.lastGateDigest.IsZero() && e.lastGateDigest.YearDay() == now.YearDay() && e.lastGateDigest.Year() == now.Year() {
+		return
+	}
+	var silenced []*core.Gate
+	byWorkspace := map[string]bool{}
+	for _, g := range gates {
+		if g.RunID == "" {
+			continue // watcher gates never nagged, so nothing has gone quiet
+		}
+		if n, ok := nags[g.ID]; ok && n.Tries > gateNagLimit {
+			silenced = append(silenced, g)
+			byWorkspace[g.Workspace] = true
+		}
+	}
+	if len(silenced) == 0 {
+		return
+	}
+	e.lastGateDigest = now
+	for ws := range byWorkspace {
+		var b strings.Builder
+		n := 0
+		for _, g := range silenced {
+			if g.Workspace != ws {
+				continue
+			}
+			n++
+			fmt.Fprintf(&b, "\n• %s (%s, open %s)", firstLine(g.Payload, 140), g.ID, since(g.CreatedAt, now))
+		}
+		e.notifyLocked(&core.Notice{
+			ID: fmt.Sprintf("gate-digest-%s-%s", ws, now.Format("2006-01-02")), Workspace: ws,
+			Kind: core.NoticeStuck,
+			Text: fmt.Sprintf("%d gate(s) still open and no longer nagging:%s\n`krakoactl answer <id> <option>`", n, b.String()),
+		})
+	}
+}
+
+// firstLine trims a gate payload to something that reads in a list.
+func firstLine(s string, max int) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	s = strings.TrimSpace(s)
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
 }
 
 // recheckGateLocked re-evaluates the condition that raised a gate, if its state
